@@ -1,18 +1,56 @@
 import os
+import re
+import time
 import httpx
 from datetime import datetime, timezone
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 app = FastAPI(title="CashCow Reviews API")
 
+# Locked to the real site(s) instead of "*". A wildcard origin doesn't stop a
+# server-to-server bot from posting fake reviews, but it does stop random
+# other websites from embedding this API in their own pages and riding on
+# it — and it costs nothing to tighten. Add any other real domains this API
+# is called from (a staging URL, etc.) to this list.
+ALLOWED_ORIGINS = [
+    "https://cashcowai.online",
+    "https://www.cashcowai.online",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # public review site, no sensitive data involved
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=ALLOWED_ORIGINS,
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type"],
 )
+
+
+# --- Simple in-memory rate limiter ---
+# Works because this runs as a single long-lived Render web service, not
+# serverless functions — counts persist across requests on the one
+# instance. If this ever scales to multiple instances, swap this for a
+# shared store (Redis, a Supabase table, etc.).
+_request_log: dict[str, list[float]] = {}
+RATE_LIMIT = 5           # max submissions
+RATE_WINDOW_SECONDS = 60 # per this many seconds, per IP
+
+
+def check_rate_limit(request: Request):
+    ip = request.client.host if request.client else "unknown"
+    now = time.time()
+    hits = [t for t in _request_log.get(ip, []) if now - t < RATE_WINDOW_SECONDS]
+    if len(hits) >= RATE_LIMIT:
+        raise HTTPException(status_code=429, detail="Too many reviews submitted — please slow down.")
+    hits.append(now)
+    _request_log[ip] = hits
+
+
+# Reject anything that looks like it's trying to inject markup. The
+# frontend also escapes review text before rendering it (defense in
+# depth), but rejecting it here means it never even reaches storage.
+HTML_TAG_RE = re.compile(r"[<>]")
 
 
 class ReviewRequest(BaseModel):
@@ -20,6 +58,20 @@ class ReviewRequest(BaseModel):
     product: str  # "ScamShield", "Encompass", "Integrity Records", or "General"
     rating: int  # 1-5
     comment: str
+
+    @field_validator("name", "product", "comment")
+    @classmethod
+    def no_markup(cls, v: str) -> str:
+        if HTML_TAG_RE.search(v):
+            raise ValueError("Field cannot contain '<' or '>' characters.")
+        return v
+
+    @field_validator("name", "comment")
+    @classmethod
+    def not_blank(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("Field cannot be blank.")
+        return v
 
 
 # --- Supabase config ---
@@ -42,7 +94,9 @@ def root():
 
 
 @app.post("/api/reviews")
-async def submit_review(payload: ReviewRequest):
+async def submit_review(payload: ReviewRequest, request: Request):
+    check_rate_limit(request)
+
     if SUPABASE_URL == "REPLACE_WITH_REAL_URL":
         return {"success": False, "error": "Reviews storage isn't configured yet."}
 
