@@ -2,10 +2,13 @@ import os
 import re
 import time
 import httpx
+import stripe
+import smtplib
+from email.message import EmailMessage
 from datetime import datetime, timezone
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, EmailStr, field_validator
 
 app = FastAPI(title="CashCow Reviews API")
 
@@ -91,6 +94,162 @@ def supabase_headers():
 @app.get("/")
 def root():
     return {"status": "CashCow Reviews API is running"}
+
+
+# --- Hire-me lead capture ---
+# Emails leads straight to your own inbox over Gmail's SMTP, using your own
+# Gmail account and an app password — no third-party form service, nothing
+# to sign up for, and nothing to check anywhere else. Set these on Render:
+# Environment -> Add Environment Variable.
+LEAD_GMAIL_ADDRESS = os.environ.get("LEAD_GMAIL_ADDRESS", "")       # e.g. cashcowaiadmin@gmail.com
+LEAD_GMAIL_APP_PASSWORD = os.environ.get("LEAD_GMAIL_APP_PASSWORD", "")  # 16-char Gmail app password
+LEAD_NOTIFY_TO = os.environ.get("LEAD_NOTIFY_TO", LEAD_GMAIL_ADDRESS)
+
+
+class LeadRequest(BaseModel):
+    name: str
+    email: EmailStr
+    message: str
+
+    @field_validator("name", "message")
+    @classmethod
+    def no_markup_lead(cls, v: str) -> str:
+        if HTML_TAG_RE.search(v):
+            raise ValueError("Field cannot contain '<' or '>' characters.")
+        return v
+
+    @field_validator("name", "message")
+    @classmethod
+    def not_blank_lead(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("Field cannot be blank.")
+        return v
+
+
+def send_lead_email(name: str, email: str, message: str):
+    if not LEAD_GMAIL_ADDRESS or not LEAD_GMAIL_APP_PASSWORD:
+        raise RuntimeError("Lead email isn't configured yet.")
+
+    msg = EmailMessage()
+    msg["Subject"] = f"New CashCow lead — {name}"
+    msg["From"] = LEAD_GMAIL_ADDRESS
+    msg["To"] = LEAD_NOTIFY_TO
+    msg["Reply-To"] = email
+    msg.set_content(
+        f"New message from the Hire Me page on cashcowai.online\n\n"
+        f"Name: {name}\n"
+        f"Email: {email}\n\n"
+        f"Message:\n{message}\n"
+    )
+
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=10) as smtp:
+        smtp.login(LEAD_GMAIL_ADDRESS, LEAD_GMAIL_APP_PASSWORD)
+        smtp.send_message(msg)
+
+
+@app.post("/api/leads")
+async def submit_lead(payload: LeadRequest, request: Request):
+    check_rate_limit(request)
+
+    name = payload.name.strip()[:80]
+    email = str(payload.email).strip()[:120]
+    message = payload.message.strip()[:2000]
+
+    try:
+        send_lead_email(name, email, message)
+    except RuntimeError:
+        return {"success": False, "error": "Lead email isn't configured yet."}
+    except Exception:
+        return {"success": False, "error": "Could not send that right now — please try again."}
+
+    return {"success": True}
+
+
+# --- Stripe checkout ---
+# Set these on Render: Environment -> Add Environment Variable.
+STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "")
+stripe.api_key = STRIPE_SECRET_KEY
+
+SITE_URL = "https://cashcowai.online"
+
+# CashCow's own bundled rent/lease/buy plans. Prices are built inline here
+# (price_data) rather than referencing pre-created Stripe Price IDs, so
+# nothing extra needs to be set up in the Stripe dashboard beyond the
+# secret key — change a price here and it takes effect on the next
+# checkout, no dashboard trip required.
+PLANS = {
+    "rent": {
+        "label": "Rent",
+        "name": "CashCow — Rent",
+        "amount": 999,       # $9.99, in cents
+        "mode": "subscription",
+        "interval": "month",
+    },
+    "lease": {
+        "label": "Lease",
+        "name": "CashCow — Lease",
+        "amount": 7900,      # $79.00
+        "mode": "subscription",
+        "interval": "year",
+    },
+    "buy": {
+        "label": "Buy",
+        "name": "CashCow — Buy",
+        "amount": 14900,     # $149.00
+        "mode": "payment",
+        "interval": None,
+    },
+}
+
+
+class CheckoutRequest(BaseModel):
+    plan: str
+
+    @field_validator("plan")
+    @classmethod
+    def known_plan(cls, v: str) -> str:
+        if v not in PLANS:
+            raise ValueError("Unknown plan.")
+        return v
+
+
+@app.get("/api/plans")
+def get_plans():
+    # Lets the cart page render live prices/labels without hardcoding
+    # them a second time in the frontend.
+    return {
+        key: {"label": p["label"], "name": p["name"], "amount": p["amount"], "mode": p["mode"], "interval": p["interval"]}
+        for key, p in PLANS.items()
+    }
+
+
+@app.post("/api/create-checkout-session")
+async def create_checkout_session(payload: CheckoutRequest, request: Request):
+    check_rate_limit(request)
+
+    if not STRIPE_SECRET_KEY:
+        raise HTTPException(status_code=500, detail="Payments aren't configured yet.")
+
+    plan = PLANS[payload.plan]
+    price_data = {
+        "currency": "usd",
+        "product_data": {"name": plan["name"]},
+        "unit_amount": plan["amount"],
+    }
+    if plan["mode"] == "subscription":
+        price_data["recurring"] = {"interval": plan["interval"]}
+
+    try:
+        session = stripe.checkout.Session.create(
+            mode=plan["mode"],
+            line_items=[{"price_data": price_data, "quantity": 1}],
+            success_url=f"{SITE_URL}/success.html?plan={payload.plan}",
+            cancel_url=f"{SITE_URL}/cart.html?plan={payload.plan}",
+        )
+    except stripe.error.StripeError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return {"url": session.url}
 
 
 @app.post("/api/reviews")
