@@ -181,21 +181,21 @@ PLANS = {
     "rent": {
         "label": "Rent",
         "name": "CashCow — Rent",
-        "amount": 999,       # $9.99, in cents
+        "amount": 2900,      # $29.00, in cents
         "mode": "subscription",
         "interval": "month",
     },
     "lease": {
         "label": "Lease",
         "name": "CashCow — Lease",
-        "amount": 7900,      # $79.00
+        "amount": 24900,     # $249.00
         "mode": "subscription",
         "interval": "year",
     },
     "buy": {
         "label": "Buy",
         "name": "CashCow — Buy",
-        "amount": 14900,     # $149.00
+        "amount": 49900,     # $499.00
         "mode": "payment",
         "interval": None,
     },
