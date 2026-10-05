@@ -1,5 +1,6 @@
 import os
 import re
+import logging
 import time
 import httpx
 import stripe
@@ -11,6 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr, field_validator
 
 app = FastAPI(title="CashCow Reviews API")
+logger = logging.getLogger("uvicorn.error")
 
 # Locked to the real site(s) instead of "*". A wildcard origin doesn't stop a
 # server-to-server bot from posting fake reviews, but it does stop random
@@ -104,6 +106,9 @@ def root():
 LEAD_GMAIL_ADDRESS = os.environ.get("LEAD_GMAIL_ADDRESS", "")       # e.g. cashcowaiadmin@gmail.com
 LEAD_GMAIL_APP_PASSWORD = os.environ.get("LEAD_GMAIL_APP_PASSWORD", "")  # 16-char Gmail app password
 LEAD_NOTIFY_TO = os.environ.get("LEAD_NOTIFY_TO", LEAD_GMAIL_ADDRESS)
+# Startup check (logs only whether each setting is present, never the values).
+logger.info("Lead email config: address set=%s, app password set=%s",
+            bool(LEAD_GMAIL_ADDRESS), bool(LEAD_GMAIL_APP_PASSWORD))
 
 
 class LeadRequest(BaseModel):
@@ -158,8 +163,10 @@ async def submit_lead(payload: LeadRequest, request: Request):
     try:
         send_lead_email(name, email, message)
     except RuntimeError:
+        logger.error("Lead email NOT sent: LEAD_GMAIL_ADDRESS / LEAD_GMAIL_APP_PASSWORD missing from the environment.")
         return {"success": False, "error": "Lead email isn't configured yet."}
-    except Exception:
+    except Exception as e:
+        logger.error("Lead email NOT sent: %s: %s", type(e).__name__, e)
         return {"success": False, "error": "Could not send that right now — please try again."}
 
     return {"success": True}
