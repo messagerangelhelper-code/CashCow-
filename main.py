@@ -22,6 +22,7 @@ logger = logging.getLogger("uvicorn.error")
 ALLOWED_ORIGINS = [
     "https://cashcowai.online",
     "https://www.cashcowai.online",
+    "https://integrity-records-platform.onrender.com",  # Render address of the same site
 ]
 
 app.add_middleware(
