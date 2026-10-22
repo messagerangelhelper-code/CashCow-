@@ -23,6 +23,7 @@ ALLOWED_ORIGINS = [
     "https://cashcowai.online",
     "https://www.cashcowai.online",
     "https://integrity-records-platform.onrender.com",  # Render address of the same site
+    "https://mybillpilot.onrender.com",                 # MyBillPilot app (Premium checkout)
 ]
 
 app.add_middleware(
@@ -207,7 +208,26 @@ PLANS = {
         "mode": "payment",
         "interval": None,
     },
+    # --- MyBillPilot Premium (sold separately, returns to the MyBillPilot app) ---
+    "mbp_monthly": {
+        "label": "Monthly",
+        "name": "MyBillPilot Premium — Monthly",
+        "amount": 499,       # $4.99
+        "mode": "subscription",
+        "interval": "month",
+        "app": "mybillpilot",
+    },
+    "mbp_yearly": {
+        "label": "Yearly",
+        "name": "MyBillPilot Premium — Yearly",
+        "amount": 4900,      # $49.00
+        "mode": "subscription",
+        "interval": "year",
+        "app": "mybillpilot",
+    },
 }
+
+MYBILLPILOT_URL = os.environ.get("MYBILLPILOT_URL", "https://mybillpilot.onrender.com")
 
 
 class CheckoutRequest(BaseModel):
@@ -228,6 +248,7 @@ def get_plans():
     return {
         key: {"label": p["label"], "name": p["name"], "amount": p["amount"], "mode": p["mode"], "interval": p["interval"]}
         for key, p in PLANS.items()
+        if not p.get("app")  # app-specific plans (MyBillPilot) aren't CashCow bundle plans
     }
 
 
@@ -247,17 +268,59 @@ async def create_checkout_session(payload: CheckoutRequest, request: Request):
     if plan["mode"] == "subscription":
         price_data["recurring"] = {"interval": plan["interval"]}
 
+    if plan.get("app") == "mybillpilot":
+        # Stripe fills in {CHECKOUT_SESSION_ID}; the app verifies it with /api/verify-session.
+        success_url = f"{MYBILLPILOT_URL}/?session_id={{CHECKOUT_SESSION_ID}}"
+        cancel_url = f"{MYBILLPILOT_URL}/"
+    else:
+        success_url = f"{SITE_URL}/success.html?plan={payload.plan}"
+        cancel_url = f"{SITE_URL}/cart.html?plan={payload.plan}"
+
     try:
         session = stripe.checkout.Session.create(
             mode=plan["mode"],
             line_items=[{"price_data": price_data, "quantity": 1}],
-            success_url=f"{SITE_URL}/success.html?plan={payload.plan}",
-            cancel_url=f"{SITE_URL}/cart.html?plan={payload.plan}",
+            success_url=success_url,
+            cancel_url=cancel_url,
+            metadata={"plan": payload.plan, "app": plan.get("app", "cashcow")},
         )
     except stripe.error.StripeError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
     return {"url": session.url}
+
+
+@app.get("/api/verify-session")
+async def verify_session(session_id: str, request: Request):
+    """
+    Used by the MyBillPilot app after Stripe checkout (and again every few
+    days) to confirm a Premium purchase is paid and the subscription is
+    still active. Returns only yes/no and the plan, never customer details.
+    """
+    check_rate_limit(request)
+    if not STRIPE_SECRET_KEY:
+        raise HTTPException(status_code=500, detail="Payments aren't configured yet.")
+    if not re.fullmatch(r"cs_(test|live)_[A-Za-z0-9]{10,200}", session_id or ""):
+        raise HTTPException(status_code=400, detail="Invalid session.")
+
+    try:
+        session = stripe.checkout.Session.retrieve(session_id, expand=["subscription"])
+    except stripe.error.InvalidRequestError:
+        return {"premium": False, "reason": "not_found"}
+    except stripe.error.StripeError:
+        raise HTTPException(status_code=502, detail="Couldn't reach Stripe. Try again shortly.")
+
+    metadata = session.get("metadata") or {}
+    if metadata.get("app") != "mybillpilot":
+        return {"premium": False, "reason": "not_mybillpilot"}
+
+    paid = session.get("status") == "complete" and session.get("payment_status") in ("paid", "no_payment_required")
+    active = paid
+    sub = session.get("subscription")
+    if sub and not isinstance(sub, str):
+        active = sub.get("status") in ("active", "trialing", "past_due")
+
+    return {"premium": bool(paid and active), "plan": metadata.get("plan")}
 
 
 @app.post("/api/reviews")
