@@ -188,22 +188,22 @@ SITE_URL = "https://cashcowai.online"
 # checkout, no dashboard trip required.
 PLANS = {
     "rent": {
-        "label": "Rent",
-        "name": "CashCow — Rent",
+        "label": "Monthly",
+        "name": "CashCow App Subscription — Monthly",
         "amount": 2900,      # $29.00, in cents
         "mode": "subscription",
         "interval": "month",
     },
     "lease": {
-        "label": "Lease",
-        "name": "CashCow — Lease",
+        "label": "Yearly",
+        "name": "CashCow App Subscription — Yearly",
         "amount": 24900,     # $249.00
         "mode": "subscription",
         "interval": "year",
     },
     "buy": {
-        "label": "Buy",
-        "name": "CashCow — Buy",
+        "label": "Lifetime",
+        "name": "CashCow App — Lifetime Access",
         "amount": 49900,     # $499.00
         "mode": "payment",
         "interval": None,
