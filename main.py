@@ -24,6 +24,7 @@ ALLOWED_ORIGINS = [
     "https://www.cashcowai.online",
     "https://integrity-records-platform.onrender.com",  # Render address of the same site
     "https://mybillpilot.onrender.com",                 # MyBillPilot app (Premium checkout)
+    "https://my-health-check-scan.onrender.com",        # My Health Check Scan app (Premium checkout)
 ]
 
 app.add_middleware(
@@ -225,9 +226,41 @@ PLANS = {
         "interval": "year",
         "app": "mybillpilot",
     },
+    # --- My Health Check Scan Premium (returns to the My Health Check Scan app) ---
+    "hcs_monthly": {
+        "label": "Monthly",
+        "name": "My Health Check Scan Premium — Monthly",
+        "amount": 299,       # $2.99
+        "mode": "subscription",
+        "interval": "month",
+        "app": "healthscan",
+    },
+    "hcs_yearly": {
+        "label": "Yearly",
+        "name": "My Health Check Scan Premium — Yearly",
+        "amount": 1999,      # $19.99
+        "mode": "subscription",
+        "interval": "year",
+        "app": "healthscan",
+    },
+    "hcs_lifetime": {
+        "label": "Lifetime",
+        "name": "My Health Check Scan Premium — Lifetime",
+        "amount": 3999,      # $39.99, one-time
+        "mode": "payment",
+        "interval": None,
+        "app": "healthscan",
+    },
 }
 
 MYBILLPILOT_URL = os.environ.get("MYBILLPILOT_URL", "https://mybillpilot.onrender.com")
+HEALTHSCAN_URL = os.environ.get("HEALTHSCAN_URL", "https://my-health-check-scan.onrender.com")
+
+# Apps that sell their own Premium through CashCow, and where Stripe sends people back.
+APP_URLS = {
+    "mybillpilot": MYBILLPILOT_URL,
+    "healthscan": HEALTHSCAN_URL,
+}
 
 
 class CheckoutRequest(BaseModel):
@@ -248,7 +281,7 @@ def get_plans():
     return {
         key: {"label": p["label"], "name": p["name"], "amount": p["amount"], "mode": p["mode"], "interval": p["interval"]}
         for key, p in PLANS.items()
-        if not p.get("app")  # app-specific plans (MyBillPilot) aren't CashCow bundle plans
+        if not p.get("app")  # app-specific plans (MyBillPilot, My Health Check Scan) aren't CashCow bundle plans
     }
 
 
@@ -268,10 +301,11 @@ async def create_checkout_session(payload: CheckoutRequest, request: Request):
     if plan["mode"] == "subscription":
         price_data["recurring"] = {"interval": plan["interval"]}
 
-    if plan.get("app") == "mybillpilot":
+    if plan.get("app") in APP_URLS:
         # Stripe fills in {CHECKOUT_SESSION_ID}; the app verifies it with /api/verify-session.
-        success_url = f"{MYBILLPILOT_URL}/?session_id={{CHECKOUT_SESSION_ID}}"
-        cancel_url = f"{MYBILLPILOT_URL}/"
+        app_url = APP_URLS[plan["app"]]
+        success_url = f"{app_url}/?session_id={{CHECKOUT_SESSION_ID}}"
+        cancel_url = f"{app_url}/"
     else:
         success_url = f"{SITE_URL}/success.html?plan={payload.plan}"
         cancel_url = f"{SITE_URL}/cart.html?plan={payload.plan}"
@@ -291,11 +325,12 @@ async def create_checkout_session(payload: CheckoutRequest, request: Request):
 
 
 @app.get("/api/verify-session")
-async def verify_session(session_id: str, request: Request):
+async def verify_session(session_id: str, request: Request, app: str = "mybillpilot"):
     """
-    Used by the MyBillPilot app after Stripe checkout (and again every few
-    days) to confirm a Premium purchase is paid and the subscription is
-    still active. Returns only yes/no and the plan, never customer details.
+    Used by the MyBillPilot and My Health Check Scan apps after Stripe checkout
+    (and again every few days) to confirm a Premium purchase is paid and the
+    subscription is still active. Returns only yes/no and the plan, never
+    customer details. ?app= says which app is asking (default: mybillpilot).
     """
     check_rate_limit(request)
     if not STRIPE_SECRET_KEY:
@@ -310,9 +345,11 @@ async def verify_session(session_id: str, request: Request):
     except stripe.error.StripeError:
         raise HTTPException(status_code=502, detail="Couldn't reach Stripe. Try again shortly.")
 
+    if app not in APP_URLS:
+        raise HTTPException(status_code=400, detail="Unknown app.")
     metadata = session.get("metadata") or {}
-    if metadata.get("app") != "mybillpilot":
-        return {"premium": False, "reason": "not_mybillpilot"}
+    if metadata.get("app") != app:
+        return {"premium": False, "reason": f"not_{app}"}
 
     paid = session.get("status") == "complete" and session.get("payment_status") in ("paid", "no_payment_required")
     active = paid
