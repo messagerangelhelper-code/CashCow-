@@ -25,13 +25,14 @@ ALLOWED_ORIGINS = [
     "https://integrity-records-platform.onrender.com",  # Render address of the same site
     "https://mybillpilot.onrender.com",                 # MyBillPilot app (Premium checkout)
     "https://my-health-check-scan.onrender.com",        # My Health Check Scan app (Premium checkout)
+    "https://my-home-kitchen-remedies.onrender.com",    # My Home Kitchen Remedies app (Premium checkout)
 ]
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
     allow_methods=["GET", "POST"],
-    allow_headers=["Content-Type"],
+    allow_headers=["Content-Type", "Authorization"],
 )
 
 
@@ -188,7 +189,10 @@ SITE_URL = "https://cashcowai.online"
 # secret key — change a price here and it takes effect on the next
 # checkout, no dashboard trip required.
 PLANS = {
+    # The bundle plans below aren't connected to any app yet, so they can't be bought
+    # ("enabled": False). They'll become CashCow All Access once accounts are in every app.
     "rent": {
+        "enabled": False,
         "label": "Monthly",
         "name": "CashCow App Subscription — Monthly",
         "amount": 2900,      # $29.00, in cents
@@ -196,6 +200,7 @@ PLANS = {
         "interval": "month",
     },
     "lease": {
+        "enabled": False,
         "label": "Yearly",
         "name": "CashCow App Subscription — Yearly",
         "amount": 24900,     # $249.00
@@ -203,6 +208,7 @@ PLANS = {
         "interval": "year",
     },
     "buy": {
+        "enabled": False,
         "label": "Lifetime",
         "name": "CashCow App — Lifetime Access",
         "amount": 49900,     # $499.00
@@ -251,15 +257,42 @@ PLANS = {
         "interval": None,
         "app": "healthscan",
     },
+    # --- My Home Kitchen Remedies Premium (returns to the remedies app) ---
+    "hkr_monthly": {
+        "label": "Monthly",
+        "name": "My Home Kitchen Remedies Premium — Monthly",
+        "amount": 199,       # $1.99
+        "mode": "subscription",
+        "interval": "month",
+        "app": "homeremedy",
+    },
+    "hkr_yearly": {
+        "label": "Yearly",
+        "name": "My Home Kitchen Remedies Premium — Yearly",
+        "amount": 1499,      # $14.99
+        "mode": "subscription",
+        "interval": "year",
+        "app": "homeremedy",
+    },
+    "hkr_lifetime": {
+        "label": "Lifetime",
+        "name": "My Home Kitchen Remedies Premium — Lifetime",
+        "amount": 2999,      # $29.99, one-time
+        "mode": "payment",
+        "interval": None,
+        "app": "homeremedy",
+    },
 }
 
 MYBILLPILOT_URL = os.environ.get("MYBILLPILOT_URL", "https://mybillpilot.onrender.com")
 HEALTHSCAN_URL = os.environ.get("HEALTHSCAN_URL", "https://my-health-check-scan.onrender.com")
+REMEDIES_URL = os.environ.get("REMEDIES_URL", "https://my-home-kitchen-remedies.onrender.com")
 
 # Apps that sell their own Premium through CashCow, and where Stripe sends people back.
 APP_URLS = {
     "mybillpilot": MYBILLPILOT_URL,
     "healthscan": HEALTHSCAN_URL,
+    "homeremedy": REMEDIES_URL,
 }
 
 
@@ -281,7 +314,7 @@ def get_plans():
     return {
         key: {"label": p["label"], "name": p["name"], "amount": p["amount"], "mode": p["mode"], "interval": p["interval"]}
         for key, p in PLANS.items()
-        if not p.get("app")  # app-specific plans (MyBillPilot, My Health Check Scan) aren't CashCow bundle plans
+        if not p.get("app") and p.get("enabled", True)  # app plans and unreleased bundle plans aren't listed
     }
 
 
@@ -293,6 +326,12 @@ async def create_checkout_session(payload: CheckoutRequest, request: Request):
         raise HTTPException(status_code=500, detail="Payments aren't configured yet.")
 
     plan = PLANS[payload.plan]
+    if not plan.get("enabled", True):
+        raise HTTPException(status_code=400, detail="That plan isn't available yet.")
+
+    # Signed in with a CashCow account? Then the purchase is tied to the account,
+    # so Premium works on every device the person signs in on.
+    user = await account_user(request.headers.get("authorization", ""))
     price_data = {
         "currency": "usd",
         "product_data": {"name": plan["name"]},
@@ -310,13 +349,24 @@ async def create_checkout_session(payload: CheckoutRequest, request: Request):
         success_url = f"{SITE_URL}/success.html?plan={payload.plan}"
         cancel_url = f"{SITE_URL}/cart.html?plan={payload.plan}"
 
+    metadata = {"plan": payload.plan, "app": plan.get("app", "cashcow")}
+    extra = {}
+    if user:
+        metadata["user_id"] = user["id"]
+        extra["client_reference_id"] = user["id"]
+        if user.get("email"):
+            extra["customer_email"] = user["email"]
+    if plan["mode"] == "subscription":
+        extra["subscription_data"] = {"metadata": metadata}
+
     try:
         session = stripe.checkout.Session.create(
             mode=plan["mode"],
             line_items=[{"price_data": price_data, "quantity": 1}],
             success_url=success_url,
             cancel_url=cancel_url,
-            metadata={"plan": payload.plan, "app": plan.get("app", "cashcow")},
+            metadata=metadata,
+            **extra,
         )
     except stripe.error.StripeError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -356,6 +406,10 @@ async def verify_session(session_id: str, request: Request, app: str = "mybillpi
     sub = session.get("subscription")
     if sub and not isinstance(sub, str):
         active = sub.get("status") in ("active", "trialing", "past_due")
+
+    # Bought while signed in: remember it on the account.
+    if paid and metadata.get("user_id"):
+        await save_entitlement(metadata["user_id"], app, metadata.get("plan", ""), session)
 
     return {"premium": bool(paid and active), "plan": metadata.get("plan")}
 
@@ -408,3 +462,146 @@ async def get_reviews():
         return {"reviews": []}
 
     return {"reviews": reviews}
+
+
+# --- CashCow accounts ---
+# One account (email + password) works in every CashCow app. Accounts live in the
+# same Supabase project ScamShield uses. Purchases made while signed in are saved
+# in the cashcow_entitlements table (see cashcow_accounts.sql), so Premium follows
+# the person to any phone or computer they sign in on.
+# Render settings: AUTH_SUPABASE_URL (the project URL) and AUTH_SUPABASE_SERVICE_KEY
+# (the project's secret key, the same one the ScamShield API uses).
+AUTH_SUPABASE_URL = (os.environ.get("AUTH_SUPABASE_URL") or "https://wbugdujmydwmzemccbiy.supabase.co").strip().rstrip("/")
+AUTH_SUPABASE_SERVICE_KEY = (os.environ.get("AUTH_SUPABASE_SERVICE_KEY") or "").strip()
+logger.info("CashCow accounts config: service key set=%s", bool(AUTH_SUPABASE_SERVICE_KEY))
+
+
+def accounts_enabled() -> bool:
+    return bool(AUTH_SUPABASE_URL and AUTH_SUPABASE_SERVICE_KEY)
+
+
+def _auth_headers() -> dict:
+    # Newer Supabase secret keys (sb_secret_...) go only in the apikey header.
+    h = {"apikey": AUTH_SUPABASE_SERVICE_KEY, "Content-Type": "application/json"}
+    if not AUTH_SUPABASE_SERVICE_KEY.startswith("sb_"):
+        h["Authorization"] = f"Bearer {AUTH_SUPABASE_SERVICE_KEY}"
+    return h
+
+
+async def account_user(authorization: str):
+    """Returns the signed-in CashCow user ({id, email}) or None."""
+    token = (authorization or "").removeprefix("Bearer ").strip()
+    if not token or not accounts_enabled():
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=8) as client:
+            resp = await client.get(f"{AUTH_SUPABASE_URL}/auth/v1/user",
+                                    headers={"apikey": AUTH_SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {token}"})
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        return {"id": data["id"], "email": data.get("email", "")} if data.get("id") else None
+    except (httpx.HTTPError, ValueError, KeyError):
+        return None
+
+
+async def save_entitlement(user_id: str, app_name: str, plan: str, session) -> None:
+    if not accounts_enabled():
+        return
+    sub = session.get("subscription")
+    sub_id = sub if isinstance(sub, str) else (sub.get("id") if sub else None)
+    row = {
+        "user_id": user_id,
+        "app": app_name,
+        "plan": plan,
+        "stripe_session_id": session.get("id"),
+        "stripe_subscription_id": sub_id,
+        "mode": session.get("mode"),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        async with httpx.AsyncClient(timeout=8) as client:
+            await client.post(
+                f"{AUTH_SUPABASE_URL}/rest/v1/cashcow_entitlements?on_conflict=stripe_session_id",
+                headers={**_auth_headers(), "Prefer": "resolution=merge-duplicates,return=minimal"},
+                json=row,
+            )
+    except httpx.HTTPError as e:
+        logger.error("Couldn't save entitlement: %s", type(e).__name__)
+
+
+def _still_active(row) -> bool:
+    """Checks Stripe live, so cancelled or unpaid subscriptions turn off on their own."""
+    if row.get("stripe_subscription_id"):
+        try:
+            sub = stripe.Subscription.retrieve(row["stripe_subscription_id"])
+            return sub.get("status") in ("active", "trialing", "past_due")
+        except stripe.error.StripeError:
+            return True  # Stripe unreachable: don't take Premium away by mistake
+    return row.get("mode") == "payment"  # one-time (lifetime) purchase
+
+
+@app.get("/api/entitlements")
+async def get_entitlements(request: Request, app: str = "healthscan"):
+    """Is the signed-in person Premium in this app? Checks their own purchases
+    for the app, plus CashCow All Access once it exists."""
+    if app not in APP_URLS:
+        raise HTTPException(status_code=400, detail="Unknown app.")
+    user = await account_user(request.headers.get("authorization", ""))
+    if not user:
+        raise HTTPException(status_code=401, detail="Sign in to your CashCow account.")
+    try:
+        async with httpx.AsyncClient(timeout=8) as client:
+            resp = await client.get(
+                f"{AUTH_SUPABASE_URL}/rest/v1/cashcow_entitlements",
+                headers=_auth_headers(),
+                params={"user_id": f"eq.{user['id']}", "app": f"in.({app},allaccess)", "select": "*", "order": "updated_at.desc"},
+            )
+        rows = resp.json() if resp.status_code == 200 else []
+    except (httpx.HTTPError, ValueError):
+        raise HTTPException(status_code=502, detail="Couldn't check your account right now.")
+    for row in rows if isinstance(rows, list) else []:
+        if _still_active(row):
+            return {"premium": True, "plan": row.get("plan"), "via": row.get("app")}
+    return {"premium": False}
+
+
+class ClaimRequest(BaseModel):
+    session_id: str
+
+
+@app.post("/api/entitlements/claim")
+async def claim_purchase(payload: ClaimRequest, request: Request, app: str = "healthscan"):
+    """Attaches a purchase made on this device (before signing in) to the
+    signed-in account, so it also works on their other devices."""
+    check_rate_limit(request)
+    if app not in APP_URLS:
+        raise HTTPException(status_code=400, detail="Unknown app.")
+    user = await account_user(request.headers.get("authorization", ""))
+    if not user:
+        raise HTTPException(status_code=401, detail="Sign in to your CashCow account.")
+    if not re.fullmatch(r"cs_(test|live)_[A-Za-z0-9]{10,200}", payload.session_id or ""):
+        raise HTTPException(status_code=400, detail="Invalid purchase.")
+    try:
+        session = stripe.checkout.Session.retrieve(payload.session_id)
+    except stripe.error.StripeError:
+        raise HTTPException(status_code=404, detail="Purchase not found.")
+    metadata = session.get("metadata") or {}
+    paid = session.get("status") == "complete" and session.get("payment_status") in ("paid", "no_payment_required")
+    if metadata.get("app") != app or not paid:
+        raise HTTPException(status_code=400, detail="That purchase isn't for this app.")
+    owner = metadata.get("user_id")
+    if owner and owner != user["id"]:
+        raise HTTPException(status_code=409, detail="That purchase belongs to another account.")
+    # Already claimed by someone else?
+    try:
+        async with httpx.AsyncClient(timeout=8) as client:
+            resp = await client.get(f"{AUTH_SUPABASE_URL}/rest/v1/cashcow_entitlements", headers=_auth_headers(),
+                                    params={"stripe_session_id": f"eq.{payload.session_id}", "select": "user_id"})
+        existing = resp.json() if resp.status_code == 200 else []
+    except (httpx.HTTPError, ValueError):
+        existing = []
+    if existing and existing[0].get("user_id") != user["id"]:
+        raise HTTPException(status_code=409, detail="That purchase belongs to another account.")
+    await save_entitlement(user["id"], app, metadata.get("plan", ""), session)
+    return {"claimed": True}
