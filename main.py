@@ -121,8 +121,11 @@ class LeadRequest(BaseModel):
     name: str
     email: EmailStr
     message: str
+    phone: str = ""      # optional (chat receptionist)
+    source: str = ""     # where it came from: hire, chat, allaccess...
+    topic: str = ""      # what it's about, e.g. "Hire me", "Help with an app"
 
-    @field_validator("name", "message")
+    @field_validator("name", "message", "phone", "source", "topic")
     @classmethod
     def no_markup_lead(cls, v: str) -> str:
         if HTML_TAG_RE.search(v):
@@ -137,21 +140,34 @@ class LeadRequest(BaseModel):
         return v
 
 
-def send_lead_email(name: str, email: str, message: str):
+LEAD_SOURCES = {
+    "hire": "the Hire Me page on cashcowai.online",
+    "chat": "the chat receptionist on cashcowai.online",
+    "allaccess": "the All Access sign-up on cashcowai.online",
+    "phone": "the CashCow phone line",
+}
+
+
+def send_lead_email(name: str, email: str, message: str, source: str = "hire", phone: str = "", topic: str = ""):
     if not LEAD_GMAIL_ADDRESS or not LEAD_GMAIL_APP_PASSWORD:
         raise RuntimeError("Lead email isn't configured yet.")
 
+    where = LEAD_SOURCES.get(source, LEAD_SOURCES["hire"])
     msg = EmailMessage()
-    msg["Subject"] = f"New CashCow lead — {name}"
+    msg["Subject"] = f"New CashCow lead — {name}" + (f" ({topic})" if topic else "")
     msg["From"] = LEAD_GMAIL_ADDRESS
     msg["To"] = LEAD_NOTIFY_TO
-    msg["Reply-To"] = email
-    msg.set_content(
-        f"New message from the Hire Me page on cashcowai.online\n\n"
-        f"Name: {name}\n"
-        f"Email: {email}\n\n"
-        f"Message:\n{message}\n"
-    )
+    if email:
+        msg["Reply-To"] = email
+    lines = [f"New message from {where}", "", f"Name: {name}"]
+    if email:
+        lines.append(f"Email: {email}")
+    if phone:
+        lines.append(f"Phone: {phone}")
+    if topic:
+        lines.append(f"About: {topic}")
+    lines += ["", "Message:", message, ""]
+    msg.set_content("\n".join(lines))
 
     with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=10) as smtp:
         smtp.login(LEAD_GMAIL_ADDRESS, LEAD_GMAIL_APP_PASSWORD)
@@ -165,9 +181,13 @@ async def submit_lead(payload: LeadRequest, request: Request):
     name = payload.name.strip()[:80]
     email = str(payload.email).strip()[:120]
     message = payload.message.strip()[:2000]
+    phone = re.sub(r"[^0-9+()\-. ]", "", payload.phone)[:30].strip()
+    source = payload.source.strip().lower()[:20]
+    source = source if source in LEAD_SOURCES and source != "phone" else "hire"
+    topic = payload.topic.strip()[:60]
 
     try:
-        send_lead_email(name, email, message)
+        send_lead_email(name, email, message, source=source, phone=phone, topic=topic)
     except RuntimeError:
         logger.error("Lead email NOT sent: LEAD_GMAIL_ADDRESS / LEAD_GMAIL_APP_PASSWORD missing from the environment.")
         return {"success": False, "error": "Lead email isn't configured yet."}
@@ -926,3 +946,155 @@ async def recall_vehicle(year: int, make: str, model: str, request: Request):
         })
     recalls.sort(key=lambda r: (not r["parkIt"], not r["parkOutside"], r["date"] and -int(r["date"].replace("-", "")) or 0))
     return {"year": year, "make": make.upper(), "model": model.upper(), "count": len(recalls), "recalls": recalls, "source": "NHTSA"}
+
+
+# --- Phone receptionist (Twilio) ---
+# A free, scripted phone line: it greets callers, tells them about the apps,
+# and takes a spoken message that's emailed to you like any other lead.
+# It stays OFF until TWILIO_AUTH_TOKEN is set on Render, and every request is
+# checked with Twilio's signature, so nobody else can trigger lead emails.
+# Twilio setup: buy a number, and under "A call comes in" choose Webhook,
+# HTTP POST, https://cashcow-reviews-api.onrender.com/api/voice/incoming
+import base64 as _b64
+import hashlib as _hashlib
+import hmac as _hmac
+from urllib.parse import parse_qs as _parse_qs
+from fastapi.responses import Response as _Response
+from xml.sax.saxutils import escape as _xml_escape
+
+TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "")
+PUBLIC_API_URL = os.environ.get("PUBLIC_API_URL", "https://cashcow-reviews-api.onrender.com").rstrip("/")
+FORWARD_TO = os.environ.get("RECEPTIONIST_FORWARD_TO", "")   # optional: your cell, e.g. +12145550123
+VOICE = "Polly.Joanna"
+
+PHONE_APPS = (
+    "ScamShield checks messages, links and phone numbers for scams. "
+    "MyBillPilot keeps your bills in one place and reminds you when they're due. "
+    "My Health Check Scan scans food barcodes for banned ingredients and allergens. "
+    "My Home Kitchen Remedies has simple remedies from your kitchen, with safety checks. "
+    "My Letter Helper writes letters for billing disputes, refunds and cancellations. "
+    "And My Recall Check checks your car for safety recalls. "
+    "Most features are free. You'll find them all at cash cow A I dot online."
+)
+
+
+def _twilio_valid(request: Request, params: dict) -> bool:
+    if not TWILIO_AUTH_TOKEN:
+        return False
+    url = PUBLIC_API_URL + request.url.path + (f"?{request.url.query}" if request.url.query else "")
+    data = url + "".join(k + params[k] for k in sorted(params))
+    digest = _hmac.new(TWILIO_AUTH_TOKEN.encode(), data.encode(), _hashlib.sha1).digest()
+    expected = _b64.b64encode(digest).decode()
+    return _hmac.compare_digest(expected, request.headers.get("X-Twilio-Signature", ""))
+
+
+async def _twilio_params(request: Request) -> dict:
+    body = (await request.body()).decode("utf-8", "replace")
+    params = {k: v[0] for k, v in _parse_qs(body, keep_blank_values=True).items()}
+    if not _twilio_valid(request, params):
+        raise HTTPException(status_code=403, detail="Not allowed.")
+    return params
+
+
+def _twiml(inner: str) -> _Response:
+    return _Response(content=f'<?xml version="1.0" encoding="UTF-8"?><Response>{inner}</Response>', media_type="application/xml")
+
+
+def _say(text: str) -> str:
+    return f'<Say voice="{VOICE}">{_xml_escape(text)}</Say>'
+
+
+def _menu_prompt(first: bool) -> str:
+    opening = "Thanks for calling CashCow, simple apps for everyday problems. " if first else ""
+    talk = " To talk to a person, press 0." if FORWARD_TO else ""
+    return _say(
+        opening
+        + "To hear about our apps, press 1 or say apps. "
+        + "To have us build an app for your business, press 2 or say build. "
+        + "For help with one of our apps, press 3 or say help. "
+        + "To leave a message, press 4 or say message." + talk
+    )
+
+
+def _ask_message(topic: str) -> str:
+    return (
+        f'<Gather input="speech" action="/api/voice/message?topic={topic}&amp;try=1" method="POST" speechTimeout="auto" timeout="8">'
+        + _say("Please say your name, the best phone number or email to reach you, and how we can help. When you're done, just stop talking.")
+        + "</Gather>"
+        + f'<Redirect method="POST">/api/voice/message?topic={topic}&amp;try=1</Redirect>'
+    )
+
+
+@app.post("/api/voice/incoming")
+async def voice_incoming(request: Request):
+    await _twilio_params(request)
+    retry = request.query_params.get("retry") == "1"
+    gather = (
+        '<Gather input="speech dtmf" numDigits="1" action="/api/voice/menu" method="POST" timeout="6" speechTimeout="auto" '
+        'hints="apps, build, help, message, person">' + _menu_prompt(first=not retry) + "</Gather>"
+    )
+    after = _ask_message("message") if retry else '<Redirect method="POST">/api/voice/incoming?retry=1</Redirect>'
+    return _twiml(gather + after)
+
+
+@app.post("/api/voice/menu")
+async def voice_menu(request: Request):
+    p = await _twilio_params(request)
+    digit = p.get("Digits", "")
+    said = p.get("SpeechResult", "").lower()
+
+    # Keypresses first; for speech, check the specific words before "app",
+    # so "I need help with an app" goes to help, not the app list.
+    if digit:
+        choice = {"1": "apps", "2": "build", "3": "help", "4": "message", "0": "person"}.get(digit, "message")
+    elif any(w in said for w in ("person", "human", "someone", "representative", "operator")):
+        choice = "person"
+    elif any(w in said for w in ("build", "business", "custom", "rebrand")):
+        choice = "build"
+    elif any(w in said for w in ("help", "support", "problem", "trouble", "issue", "cancel", "refund")):
+        choice = "help"
+    elif "message" in said:
+        choice = "message"
+    elif "app" in said:
+        choice = "apps"
+    else:
+        choice = "message"
+
+    if choice == "apps":
+        return _twiml(_say(PHONE_APPS) + _say("If you'd like us to call you back, leave a message now.") + _ask_message("apps"))
+    if choice == "build":
+        return _twiml(_say("Great. CashCow builds custom apps and can rebrand any of ours for your business.") + _ask_message("build"))
+    if choice == "help":
+        return _twiml(_say("Sorry you're having trouble. Tell us which app and what's happening.") + _ask_message("help"))
+    if choice == "person" and FORWARD_TO:
+        return _twiml(_say("Connecting you now.") + f'<Dial timeout="20">{_xml_escape(FORWARD_TO)}</Dial>'
+                      + _say("Sorry, nobody's available right now.") + _ask_message("message"))
+    return _twiml(_ask_message("message"))
+
+
+VOICE_TOPICS = {"apps": "Apps question (phone)", "build": "Build an app (phone)", "help": "Help with an app (phone)", "message": "Phone message"}
+
+
+@app.post("/api/voice/message")
+async def voice_message(request: Request):
+    p = await _twilio_params(request)
+    topic = request.query_params.get("topic", "message")
+    topic = topic if topic in VOICE_TOPICS else "message"
+    said = p.get("SpeechResult", "").strip()
+    caller = re.sub(r"[^0-9+]", "", p.get("From", ""))[:20]
+    if not said:
+        if request.query_params.get("try") == "1":
+            return _twiml(_say("Sorry, I didn't catch that.") + _ask_message(topic).replace("try=1", "try=2"))
+        return _twiml(_say("Sorry, we didn't get a message. Please call back, or visit cash cow A I dot online. Goodbye.") + "<Hangup/>")
+    try:
+        send_lead_email(
+            name=f"Caller {caller or 'unknown number'}",
+            email="",
+            message=f"Transcribed by the phone line (check for mistakes):\n\n{said[:2000]}",
+            source="phone",
+            phone=caller,
+            topic=VOICE_TOPICS[topic],
+        )
+    except Exception as e:  # still thank the caller; the log shows what went wrong
+        logger.error("Phone lead email NOT sent: %s: %s", type(e).__name__, e)
+    return _twiml(_say("Thank you. We got your message and we'll get back to you within one business day. Goodbye.") + "<Hangup/>")
