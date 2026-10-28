@@ -27,6 +27,7 @@ ALLOWED_ORIGINS = [
     "https://my-health-check-scan.onrender.com",        # My Health Check Scan app (Premium checkout)
     "https://my-home-kitchen-remedies.onrender.com",    # My Home Kitchen Remedies app (Premium checkout)
     "https://my-letter-helper.onrender.com",            # My Letter Helper app (Premium checkout)
+    "https://my-recall-check.onrender.com",             # My Recall Check app (Premium checkout, recall lookups)
 ]
 
 app.add_middleware(
@@ -308,12 +309,38 @@ PLANS = {
         "interval": None,
         "app": "letterhelper",
     },
+    # --- My Recall Check Premium (returns to the recall app) ---
+    "mrc_monthly": {
+        "label": "Monthly",
+        "name": "My Recall Check Premium — Monthly",
+        "amount": 199,       # $1.99
+        "mode": "subscription",
+        "interval": "month",
+        "app": "recallcheck",
+    },
+    "mrc_yearly": {
+        "label": "Yearly",
+        "name": "My Recall Check Premium — Yearly",
+        "amount": 1499,      # $14.99
+        "mode": "subscription",
+        "interval": "year",
+        "app": "recallcheck",
+    },
+    "mrc_lifetime": {
+        "label": "Lifetime",
+        "name": "My Recall Check Premium — Lifetime",
+        "amount": 2999,      # $29.99, one-time
+        "mode": "payment",
+        "interval": None,
+        "app": "recallcheck",
+    },
 }
 
 MYBILLPILOT_URL = os.environ.get("MYBILLPILOT_URL", "https://mybillpilot.onrender.com")
 HEALTHSCAN_URL = os.environ.get("HEALTHSCAN_URL", "https://my-health-check-scan.onrender.com")
 REMEDIES_URL = os.environ.get("REMEDIES_URL", "https://my-home-kitchen-remedies.onrender.com")
 LETTERS_URL = os.environ.get("LETTERS_URL", "https://my-letter-helper.onrender.com")
+RECALLS_URL = os.environ.get("RECALLS_URL", "https://my-recall-check.onrender.com")
 
 # Apps that sell their own Premium through CashCow, and where Stripe sends people back.
 APP_URLS = {
@@ -321,6 +348,7 @@ APP_URLS = {
     "healthscan": HEALTHSCAN_URL,
     "homeremedy": REMEDIES_URL,
     "letterhelper": LETTERS_URL,
+    "recallcheck": RECALLS_URL,
 }
 
 
@@ -731,3 +759,170 @@ async def health_topics(q: str, request: Request):
         _medline_cache.pop(next(iter(_medline_cache)))
     _medline_cache[key] = (time.time(), results)
     return {"results": results, "source": "MedlinePlus.gov"}
+
+
+# --- Vehicle recalls from NHTSA (My Recall Check) ---
+# Free U.S. government data, no key needed. Answers are cached so repeat
+# lookups are fast and NHTSA isn't asked the same thing over and over.
+from datetime import date as _date
+
+NHTSA_RECALLS = "https://api.nhtsa.gov/recalls/recallsByVehicle"
+NHTSA_MAKES = "https://api.nhtsa.gov/products/vehicle/makes"
+NHTSA_MODELS = "https://api.nhtsa.gov/products/vehicle/models"
+VPIC_DECODE = "https://vpic.nhtsa.dot.gov/api/vehicles/DecodeVinValues/{vin}"
+NHTSA_MAX_PER_MINUTE = 60
+RECALL_IP_LIMIT = 40                 # lookups per minute per visitor
+_nhtsa_cache: dict[str, tuple[float, object]] = {}
+_nhtsa_calls: list[float] = []
+_recall_ip_log: dict[str, list[float]] = {}
+_NAME_RE = re.compile(r"^[A-Za-z0-9 .&'/\-]{1,60}$")
+_VIN_RE = re.compile(r"^[A-HJ-NPR-Z0-9]{17}$")
+
+
+def _ci(item: dict, *names: str):
+    """Reads a field whatever its capitalization (NHTSA mixes styles)."""
+    low = {str(k).lower(): v for k, v in item.items()}
+    for n in names:
+        if n.lower() in low:
+            return low[n.lower()]
+    return None
+
+
+def _result_list(data) -> list:
+    if isinstance(data, dict):
+        v = _ci(data, "results")
+        return v if isinstance(v, list) else []
+    return data if isinstance(data, list) else []
+
+
+def _iso_date(text) -> str:
+    t = str(text or "").strip()
+    m = re.match(r"^(\d{1,2})/(\d{1,2})/(\d{4})$", t)   # NHTSA sends DD/MM/YYYY
+    if m:
+        try:
+            return _date(int(m.group(3)), int(m.group(2)), int(m.group(1))).isoformat()
+        except ValueError:
+            return ""
+    m = re.match(r"^(\d{4})-(\d{2})-(\d{2})", t)
+    return m.group(0) if m else ""
+
+
+def _flag(v) -> bool:
+    return v is True or str(v).strip().lower() in ("true", "yes", "y", "1")
+
+
+def _recall_guard(request: Request):
+    ip = request.client.host if request.client else "unknown"
+    now = time.time()
+    hits = [t for t in _recall_ip_log.get(ip, []) if now - t < 60]
+    if len(hits) >= RECALL_IP_LIMIT:
+        raise HTTPException(status_code=429, detail="Too many lookups. Please wait a minute.")
+    _recall_ip_log[ip] = hits + [now]
+
+
+async def _nhtsa_get(url: str, params: dict, ttl: int):
+    key = url + "?" + "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+    hit = _nhtsa_cache.get(key)
+    if hit and time.time() - hit[0] < ttl:
+        return hit[1]
+    now = time.time()
+    _nhtsa_calls[:] = [t for t in _nhtsa_calls if now - t < 60]
+    if len(_nhtsa_calls) >= NHTSA_MAX_PER_MINUTE:
+        raise HTTPException(status_code=503, detail="Recall lookups are busy. Try again in a minute.")
+    _nhtsa_calls.append(now)
+    try:
+        async with httpx.AsyncClient(timeout=12) as client:
+            resp = await client.get(url, params=params)
+        if resp.status_code == 400:
+            data = {"results": []}       # NHTSA answers 400 when it has nothing for that vehicle
+        elif resp.status_code != 200:
+            raise HTTPException(status_code=502, detail="NHTSA isn't answering right now. Try again soon.")
+        else:
+            data = resp.json()
+    except (httpx.HTTPError, ValueError):
+        raise HTTPException(status_code=502, detail="NHTSA isn't answering right now. Try again soon.")
+    if len(_nhtsa_cache) >= 3000:
+        _nhtsa_cache.pop(next(iter(_nhtsa_cache)))
+    _nhtsa_cache[key] = (time.time(), data)
+    return data
+
+
+def _check_year(year: int):
+    if not 1950 <= year <= _date.today().year + 2:
+        raise HTTPException(status_code=400, detail="Choose a model year.")
+
+
+def _check_name(value: str, what: str) -> str:
+    value = " ".join(value.split()).upper()
+    if not _NAME_RE.match(value):
+        raise HTTPException(status_code=400, detail=f"Choose a {what}.")
+    return value
+
+
+@app.get("/api/recalls/makes")
+async def recall_makes(year: int, request: Request):
+    _check_year(year)
+    _recall_guard(request)
+    data = await _nhtsa_get(NHTSA_MAKES, {"modelYear": year, "issueType": "r"}, 7 * 86400)
+    makes = sorted({str(_ci(i, "make") or "").strip().upper() for i in _result_list(data) if isinstance(i, dict)} - {""})
+    return {"year": year, "makes": makes}
+
+
+@app.get("/api/recalls/models")
+async def recall_models(year: int, make: str, request: Request):
+    _check_year(year)
+    make = _check_name(make, "make")
+    _recall_guard(request)
+    data = await _nhtsa_get(NHTSA_MODELS, {"modelYear": year, "make": make, "issueType": "r"}, 7 * 86400)
+    models = sorted({str(_ci(i, "model") or "").strip().upper() for i in _result_list(data) if isinstance(i, dict)} - {""})
+    return {"year": year, "make": make.upper(), "models": models}
+
+
+@app.get("/api/recalls/vin")
+async def recall_vin(vin: str, request: Request):
+    vin = vin.strip().upper()
+    if not _VIN_RE.match(vin):
+        raise HTTPException(status_code=400, detail="A VIN is 17 letters and numbers (never I, O or Q).")
+    _recall_guard(request)
+    data = await _nhtsa_get(VPIC_DECODE.format(vin=vin), {"format": "json"}, 30 * 86400)
+    rows = _result_list(data)
+    row = rows[0] if rows and isinstance(rows[0], dict) else {}
+    year = str(_ci(row, "ModelYear") or "").strip()
+    make = str(_ci(row, "Make") or "").strip().upper()
+    model = str(_ci(row, "Model") or "").strip().upper()
+    if not (year.isdigit() and make and model):
+        raise HTTPException(status_code=404, detail="We couldn't read that VIN. Check it, or pick the year, make and model instead.")
+    code = str(_ci(row, "ErrorCode") or "0").strip()
+    return {"vin": vin, "year": int(year), "make": make, "model": model, "checkDigitWarning": not code.startswith("0")}
+
+
+@app.get("/api/recalls/vehicle")
+async def recall_vehicle(year: int, make: str, model: str, request: Request):
+    _check_year(year)
+    make = _check_name(make, "make")
+    model = _check_name(model, "model")
+    _recall_guard(request)
+    data = await _nhtsa_get(NHTSA_RECALLS, {"make": make, "model": model, "modelYear": year}, 12 * 3600)
+    recalls, seen = [], set()
+    for i in _result_list(data):
+        if not isinstance(i, dict):
+            continue
+        campaign = str(_ci(i, "NHTSACampaignNumber") or "").strip()
+        if not campaign or campaign in seen:
+            continue
+        seen.add(campaign)
+        recalls.append({
+            "campaign": campaign[:20],
+            "date": _iso_date(_ci(i, "ReportReceivedDate")),
+            "component": str(_ci(i, "Component") or "")[:300],
+            "summary": str(_ci(i, "Summary") or "")[:3000],
+            "consequence": str(_ci(i, "Consequence") or "")[:2000],
+            "remedy": str(_ci(i, "Remedy") or "")[:2000],
+            "notes": str(_ci(i, "Notes") or "")[:2000],
+            "manufacturer": str(_ci(i, "Manufacturer") or "")[:200],
+            "parkIt": _flag(_ci(i, "parkIt")),
+            "parkOutside": _flag(_ci(i, "parkOutSide", "parkOutside")),
+            "overTheAir": _flag(_ci(i, "overTheAirUpdate")),
+        })
+    recalls.sort(key=lambda r: (not r["parkIt"], not r["parkOutside"], r["date"] and -int(r["date"].replace("-", "")) or 0))
+    return {"year": year, "make": make.upper(), "model": model.upper(), "count": len(recalls), "recalls": recalls, "source": "NHTSA"}
