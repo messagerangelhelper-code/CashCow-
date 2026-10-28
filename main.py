@@ -26,6 +26,7 @@ ALLOWED_ORIGINS = [
     "https://mybillpilot.onrender.com",                 # MyBillPilot app (Premium checkout)
     "https://my-health-check-scan.onrender.com",        # My Health Check Scan app (Premium checkout)
     "https://my-home-kitchen-remedies.onrender.com",    # My Home Kitchen Remedies app (Premium checkout)
+    "https://my-letter-helper.onrender.com",            # My Letter Helper app (Premium checkout)
 ]
 
 app.add_middleware(
@@ -282,17 +283,44 @@ PLANS = {
         "interval": None,
         "app": "homeremedy",
     },
+    # --- My Letter Helper Premium (returns to the letter app) ---
+    "mlh_monthly": {
+        "label": "Monthly",
+        "name": "My Letter Helper Premium — Monthly",
+        "amount": 199,       # $1.99
+        "mode": "subscription",
+        "interval": "month",
+        "app": "letterhelper",
+    },
+    "mlh_yearly": {
+        "label": "Yearly",
+        "name": "My Letter Helper Premium — Yearly",
+        "amount": 1499,      # $14.99
+        "mode": "subscription",
+        "interval": "year",
+        "app": "letterhelper",
+    },
+    "mlh_lifetime": {
+        "label": "Lifetime",
+        "name": "My Letter Helper Premium — Lifetime",
+        "amount": 2999,      # $29.99, one-time
+        "mode": "payment",
+        "interval": None,
+        "app": "letterhelper",
+    },
 }
 
 MYBILLPILOT_URL = os.environ.get("MYBILLPILOT_URL", "https://mybillpilot.onrender.com")
 HEALTHSCAN_URL = os.environ.get("HEALTHSCAN_URL", "https://my-health-check-scan.onrender.com")
 REMEDIES_URL = os.environ.get("REMEDIES_URL", "https://my-home-kitchen-remedies.onrender.com")
+LETTERS_URL = os.environ.get("LETTERS_URL", "https://my-letter-helper.onrender.com")
 
 # Apps that sell their own Premium through CashCow, and where Stripe sends people back.
 APP_URLS = {
     "mybillpilot": MYBILLPILOT_URL,
     "healthscan": HEALTHSCAN_URL,
     "homeremedy": REMEDIES_URL,
+    "letterhelper": LETTERS_URL,
 }
 
 
