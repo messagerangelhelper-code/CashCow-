@@ -28,6 +28,7 @@ ALLOWED_ORIGINS = [
     "https://my-home-kitchen-remedies.onrender.com",    # My Home Kitchen Remedies app (Premium checkout)
     "https://my-letter-helper.onrender.com",            # My Letter Helper app (Premium checkout)
     "https://my-recall-check.onrender.com",             # My Recall Check app (Premium checkout, recall lookups)
+    "https://my-caregiver-circle.onrender.com",         # My Caregiver Circle app (shared care circles)
 ]
 
 app.add_middleware(
@@ -354,6 +355,31 @@ PLANS = {
         "interval": None,
         "app": "recallcheck",
     },
+    # --- My Caregiver Circle Premium (returns to the caregiver app) ---
+    "cgc_monthly": {
+        "label": "Monthly",
+        "name": "My Caregiver Circle Premium — Monthly",
+        "amount": 299,       # $2.99
+        "mode": "subscription",
+        "interval": "month",
+        "app": "caregiver",
+    },
+    "cgc_yearly": {
+        "label": "Yearly",
+        "name": "My Caregiver Circle Premium — Yearly",
+        "amount": 1999,      # $19.99
+        "mode": "subscription",
+        "interval": "year",
+        "app": "caregiver",
+    },
+    "cgc_lifetime": {
+        "label": "Lifetime",
+        "name": "My Caregiver Circle Premium — Lifetime",
+        "amount": 3999,      # $39.99, one-time
+        "mode": "payment",
+        "interval": None,
+        "app": "caregiver",
+    },
 }
 
 MYBILLPILOT_URL = os.environ.get("MYBILLPILOT_URL", "https://mybillpilot.onrender.com")
@@ -361,6 +387,7 @@ HEALTHSCAN_URL = os.environ.get("HEALTHSCAN_URL", "https://my-health-check-scan.
 REMEDIES_URL = os.environ.get("REMEDIES_URL", "https://my-home-kitchen-remedies.onrender.com")
 LETTERS_URL = os.environ.get("LETTERS_URL", "https://my-letter-helper.onrender.com")
 RECALLS_URL = os.environ.get("RECALLS_URL", "https://my-recall-check.onrender.com")
+CAREGIVER_URL = os.environ.get("CAREGIVER_URL", "https://my-caregiver-circle.onrender.com")
 
 # Apps that sell their own Premium through CashCow, and where Stripe sends people back.
 APP_URLS = {
@@ -369,6 +396,7 @@ APP_URLS = {
     "homeremedy": REMEDIES_URL,
     "letterhelper": LETTERS_URL,
     "recallcheck": RECALLS_URL,
+    "caregiver": CAREGIVER_URL,
 }
 
 
@@ -1037,35 +1065,38 @@ async def voice_incoming(request: Request):
     return _twiml(gather + after)
 
 
+def _menu_choice(digit: str, said: str) -> str:
+    """Keypresses first; for speech, check the specific words before "app",
+    so "I need help with an app" goes to help, not the app list."""
+    said = (said or "").lower()
+    if digit:
+        return {"1": "apps", "2": "build", "3": "help", "4": "message", "0": "person"}.get(digit, "message")
+    if any(w in said for w in ("person", "human", "someone", "representative", "operator")):
+        return "person"
+    if any(w in said for w in ("build", "business", "custom", "rebrand")):
+        return "build"
+    if any(w in said for w in ("help", "support", "problem", "trouble", "issue", "cancel", "refund")):
+        return "help"
+    if "message" in said:
+        return "message"
+    if "app" in said:
+        return "apps"
+    return "message"
+
+
+MENU_LINES = {
+    "apps": [PHONE_APPS, "If you'd like us to call you back, leave a message now."],
+    "build": ["Great. CashCow builds custom apps and can rebrand any of ours for your business."],
+    "help": ["Sorry you're having trouble. Tell us which app and what's happening."],
+}
+
+
 @app.post("/api/voice/menu")
 async def voice_menu(request: Request):
     p = await _twilio_params(request)
-    digit = p.get("Digits", "")
-    said = p.get("SpeechResult", "").lower()
-
-    # Keypresses first; for speech, check the specific words before "app",
-    # so "I need help with an app" goes to help, not the app list.
-    if digit:
-        choice = {"1": "apps", "2": "build", "3": "help", "4": "message", "0": "person"}.get(digit, "message")
-    elif any(w in said for w in ("person", "human", "someone", "representative", "operator")):
-        choice = "person"
-    elif any(w in said for w in ("build", "business", "custom", "rebrand")):
-        choice = "build"
-    elif any(w in said for w in ("help", "support", "problem", "trouble", "issue", "cancel", "refund")):
-        choice = "help"
-    elif "message" in said:
-        choice = "message"
-    elif "app" in said:
-        choice = "apps"
-    else:
-        choice = "message"
-
-    if choice == "apps":
-        return _twiml(_say(PHONE_APPS) + _say("If you'd like us to call you back, leave a message now.") + _ask_message("apps"))
-    if choice == "build":
-        return _twiml(_say("Great. CashCow builds custom apps and can rebrand any of ours for your business.") + _ask_message("build"))
-    if choice == "help":
-        return _twiml(_say("Sorry you're having trouble. Tell us which app and what's happening.") + _ask_message("help"))
+    choice = _menu_choice(p.get("Digits", ""), p.get("SpeechResult", ""))
+    if choice in MENU_LINES:
+        return _twiml("".join(_say(t) for t in MENU_LINES[choice]) + _ask_message(choice))
     if choice == "person" and FORWARD_TO:
         return _twiml(_say("Connecting you now.") + f'<Dial timeout="20">{_xml_escape(FORWARD_TO)}</Dial>'
                       + _say("Sorry, nobody's available right now.") + _ask_message("message"))
@@ -1098,3 +1129,425 @@ async def voice_message(request: Request):
     except Exception as e:  # still thank the caller; the log shows what went wrong
         logger.error("Phone lead email NOT sent: %s: %s", type(e).__name__, e)
     return _twiml(_say("Thank you. We got your message and we'll get back to you within one business day. Goodbye.") + "<Hangup/>")
+
+
+# --- Phone receptionist (Plivo) ---
+# The same scripted phone line as the Twilio one above, for a Plivo number
+# (Plivo's pay-as-you-go plan starts with free trial credit). It stays OFF
+# until PLIVO_WEBHOOK_KEY is set on Render. The key is part of the web address
+# you give Plivo, so only Plivo (which knows the address) can reach it:
+#   Answer URL: https://cashcow-reviews-api.onrender.com/api/plivo/<your key>/incoming  (POST)
+PLIVO_WEBHOOK_KEY = os.environ.get("PLIVO_WEBHOOK_KEY", "")
+PLIVO_VOICE = os.environ.get("PLIVO_VOICE", "WOMAN")
+
+
+def _plivo_check(key: str):
+    if len(PLIVO_WEBHOOK_KEY) < 16 or not _hmac.compare_digest(key, PLIVO_WEBHOOK_KEY):
+        raise HTTPException(status_code=404, detail="Not found.")
+
+
+async def _plivo_params(request: Request) -> dict:
+    params = dict(request.query_params)
+    if request.method == "POST":
+        body = (await request.body()).decode("utf-8", "replace")
+        params.update({k: v[0] for k, v in _parse_qs(body, keep_blank_values=True).items()})
+    return params
+
+
+def _plivo_url(path: str) -> str:
+    return f"{PUBLIC_API_URL}/api/plivo/{PLIVO_WEBHOOK_KEY}/{path}"
+
+
+def _pspeak(text: str) -> str:
+    return f'<Speak voice="{_xml_escape(PLIVO_VOICE)}" language="en-US">{_xml_escape(text)}</Speak>'
+
+
+def _plivo_xml(inner: str) -> _Response:
+    return _Response(content=f'<?xml version="1.0" encoding="UTF-8"?><Response>{inner}</Response>', media_type="application/xml")
+
+
+def _plivo_ask_message(topic: str, attempt: int = 1) -> str:
+    action = _xml_escape(_plivo_url(f"message?topic={topic}&try={attempt}"))
+    return (
+        f'<GetInput action="{action}" method="POST" inputType="speech" executionTimeout="30" '
+        f'speechEndTimeout="3" redirect="true">'
+        + _pspeak("Please say your name, the best phone number or email to reach you, and how we can help. When you're done, just stop talking.")
+        + "</GetInput>"
+        + f'<Redirect method="POST">{action}</Redirect>'
+    )
+
+
+def _plivo_menu_prompt(first: bool) -> str:
+    opening = "Thanks for calling CashCow, simple apps for everyday problems. " if first else ""
+    talk = " To talk to a person, press 0." if FORWARD_TO else ""
+    return _pspeak(
+        opening
+        + "To hear about our apps, press 1 or say apps. "
+        + "To have us build an app for your business, press 2 or say build. "
+        + "For help with one of our apps, press 3 or say help. "
+        + "To leave a message, press 4 or say message." + talk
+    )
+
+
+@app.get("/api/plivo/{key}/incoming")
+@app.post("/api/plivo/{key}/incoming")
+async def plivo_incoming(key: str, request: Request):
+    _plivo_check(key)
+    p = await _plivo_params(request)
+    retry = p.get("retry") == "1"
+    action = _xml_escape(_plivo_url("menu"))
+    gather = (
+        f'<GetInput action="{action}" method="POST" inputType="dtmf speech" numDigits="1" executionTimeout="8" '
+        f'redirect="true" hints="apps,build,help,message,person">' + _plivo_menu_prompt(first=not retry) + "</GetInput>"
+    )
+    after = _plivo_ask_message("message") if retry else f'<Redirect method="POST">{_xml_escape(_plivo_url("incoming?retry=1"))}</Redirect>'
+    return _plivo_xml(gather + after)
+
+
+@app.get("/api/plivo/{key}/menu")
+@app.post("/api/plivo/{key}/menu")
+async def plivo_menu(key: str, request: Request):
+    _plivo_check(key)
+    p = await _plivo_params(request)
+    choice = _menu_choice(p.get("Digits", ""), p.get("Speech", ""))
+    if choice in MENU_LINES:
+        return _plivo_xml("".join(_pspeak(t) for t in MENU_LINES[choice]) + _plivo_ask_message(choice))
+    if choice == "person" and FORWARD_TO:
+        return _plivo_xml(_pspeak("Connecting you now.") + f"<Dial><Number>{_xml_escape(FORWARD_TO)}</Number></Dial>"
+                          + _pspeak("Sorry, nobody's available right now.") + _plivo_ask_message("message"))
+    return _plivo_xml(_plivo_ask_message("message"))
+
+
+@app.get("/api/plivo/{key}/message")
+@app.post("/api/plivo/{key}/message")
+async def plivo_message(key: str, request: Request):
+    _plivo_check(key)
+    p = await _plivo_params(request)
+    topic = p.get("topic", "message")
+    topic = topic if topic in VOICE_TOPICS else "message"
+    said = p.get("Speech", "").strip()
+    caller = re.sub(r"[^0-9+]", "", p.get("From", ""))[:20]
+    if not said:
+        if p.get("try") == "1":
+            return _plivo_xml(_pspeak("Sorry, I didn't catch that.") + _plivo_ask_message(topic, attempt=2))
+        return _plivo_xml(_pspeak("Sorry, we didn't get a message. Please call back, or visit cash cow A I dot online. Goodbye.") + "<Hangup/>")
+    try:
+        send_lead_email(
+            name=f"Caller {caller or 'unknown number'}",
+            email="",
+            message=f"Transcribed by the phone line (check for mistakes):\n\n{said[:2000]}",
+            source="phone",
+            phone=caller,
+            topic=VOICE_TOPICS[topic],
+        )
+    except Exception as e:  # still thank the caller; the log shows what went wrong
+        logger.error("Phone lead email NOT sent: %s: %s", type(e).__name__, e)
+    return _plivo_xml(_pspeak("Thank you. We got your message and we'll get back to you within one business day. Goodbye.") + "<Hangup/>")
+
+
+# --- My Caregiver Circle: shared family care plans ---
+# Data lives in the Supabase tables from caregiver_circle.sql. Only this server can
+# reach them: it checks who is signed in, then the database functions check that
+# the person belongs to the circle before showing or changing anything.
+import uuid as _uuid
+
+CARE_APP = "caregiver"
+CARE_FREE_MEMBERS, CARE_PREMIUM_MEMBERS = 2, 10
+CARE_FREE_CIRCLES, CARE_PREMIUM_CIRCLES = 1, 3
+CARE_WRITE_LIMIT = 60   # changes per minute per person
+_care_write_log: dict[str, list[float]] = {}
+
+CARE_ERRORS = {
+    "not_member": (403, "You're not in this circle anymore."),
+    "not_owner": (403, "Only the circle's organizer can do that."),
+    "limit_circles": (403, "You've reached your circle limit. Premium lets you organize up to 3 circles."),
+    "limit_members": (403, "This circle is full. The organizer can upgrade to Premium for up to 10 members."),
+    "bad_code": (404, "That invite code didn't match a circle. Check it and try again."),
+    "already_member": (409, "You're already in this circle."),
+    "not_found": (404, "That item was already removed."),
+    "owner_cannot_leave": (400, "The organizer can't leave. Delete the circle instead, or keep it."),
+    "bad_assignee": (400, "That person isn't in this circle."),
+    "too_many_items": (400, "This circle has too many items. Delete some old ones first."),
+}
+
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_TIME_RE = re.compile(r"^\d{2}:\d{2}$")
+
+# Allowed fields per kind: (name, max length or "date"/"time").
+CARE_FIELDS = {
+    "appointment": [("title", 80), ("date", "date"), ("time", "time"), ("place", 120), ("with", 80), ("notes", 500)],
+    "medicine": [("name", 80), ("dose", 80), ("when", 120), ("purpose", 120), ("prescriber", 80), ("pharmacy", 80), ("notes", 500)],
+    "todo": [("title", 120), ("due", "date"), ("notes", 300)],
+    "card": [("person", 60), ("birth_date", "date"), ("phone", 40), ("address", 200), ("conditions", 500),
+             ("allergies", 300), ("doctors", 500), ("insurance", 300), ("pharmacy", 200), ("contacts", 500),
+             ("hospital", 120), ("notes", 800)],
+}
+CARE_REQUIRED = {"appointment": "title", "medicine": "name", "todo": "title"}
+
+
+def _care_clean(kind: str, data) -> dict:
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=400, detail="Something was missing. Please try again.")
+    out = {}
+    for name, rule in CARE_FIELDS[kind]:
+        v = data.get(name)
+        if v is None:
+            continue
+        v = str(v).strip()
+        if not v:
+            continue
+        if rule == "date":
+            if not _DATE_RE.match(v):
+                raise HTTPException(status_code=400, detail="Please pick a valid date.")
+        elif rule == "time":
+            if not _TIME_RE.match(v):
+                raise HTTPException(status_code=400, detail="Please pick a valid time.")
+        else:
+            v = v[:rule]
+        out[name] = v
+    need = CARE_REQUIRED.get(kind)
+    if need and not out.get(need):
+        raise HTTPException(status_code=400, detail=f"Please add a {need}.")
+    return out
+
+
+def _uuid_or_400(v: str) -> str:
+    try:
+        return str(_uuid.UUID(str(v)))
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="That link doesn't look right.")
+
+
+async def _care_user(request: Request) -> dict:
+    user = await account_user(request.headers.get("authorization", ""))
+    if not user:
+        raise HTTPException(status_code=401, detail="Please sign in to your CashCow account.")
+    return user
+
+
+def _care_write_guard(user_id: str):
+    now = time.time()
+    hits = [t for t in _care_write_log.get(user_id, []) if now - t < 60]
+    if len(hits) >= CARE_WRITE_LIMIT:
+        raise HTTPException(status_code=429, detail="That's a lot of changes at once. Please wait a minute.")
+    _care_write_log[user_id] = hits + [now]
+
+
+async def _care_rpc(fn: str, args: dict):
+    if not accounts_enabled():
+        raise HTTPException(status_code=503, detail="Circles aren't set up yet.")
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(f"{AUTH_SUPABASE_URL}/rest/v1/rpc/{fn}", headers=_auth_headers(), json=args)
+    except httpx.HTTPError:
+        raise HTTPException(status_code=502, detail="Couldn't reach your circle right now. Please try again.")
+    if resp.status_code >= 400:
+        try:
+            msg = str(resp.json().get("message", ""))
+        except ValueError:
+            msg = ""
+        if msg in CARE_ERRORS:
+            code, text = CARE_ERRORS[msg]
+            raise HTTPException(status_code=code, detail=text)
+        logger.error("care rpc %s failed: %s %s", fn, resp.status_code, msg[:200])
+        raise HTTPException(status_code=502, detail="Something went wrong saving that. Please try again.")
+    if not resp.content:
+        return None
+    try:
+        return resp.json()
+    except ValueError:
+        return None
+
+
+async def _user_premium(user_id: str, app_name: str) -> bool:
+    """Same check as /api/entitlements, for any user id (used for circle limits)."""
+    try:
+        async with httpx.AsyncClient(timeout=8) as client:
+            resp = await client.get(
+                f"{AUTH_SUPABASE_URL}/rest/v1/cashcow_entitlements",
+                headers=_auth_headers(),
+                params={"user_id": f"eq.{user_id}", "app": f"in.({app_name},allaccess)", "select": "*", "order": "updated_at.desc"},
+            )
+        rows = resp.json() if resp.status_code == 200 else []
+    except (httpx.HTTPError, ValueError):
+        return False
+    return any(_still_active(r) for r in (rows if isinstance(rows, list) else []))
+
+
+class CareCircleIn(BaseModel):
+    name: str
+    display_name: str
+
+
+class CareJoinIn(BaseModel):
+    code: str
+    display_name: str
+
+
+class CareItemIn(BaseModel):
+    kind: str
+    data: dict
+    assigned_to: str | None = None
+
+
+class CareItemUpdate(BaseModel):
+    data: dict | None = None
+    done: bool | None = None
+    set_assigned: bool = False
+    assigned_to: str | None = None
+
+
+class CareCardIn(BaseModel):
+    card: dict
+
+
+class CareNameIn(BaseModel):
+    name: str
+
+
+class CareMemberIn(BaseModel):
+    user_id: str
+
+
+@app.get("/api/care/limits")
+async def care_limits(request: Request):
+    user = await _care_user(request)
+    premium = await _user_premium(user["id"], CARE_APP)
+    return {
+        "premium": premium,
+        "max_members": CARE_PREMIUM_MEMBERS if premium else CARE_FREE_MEMBERS,
+        "max_circles": CARE_PREMIUM_CIRCLES if premium else CARE_FREE_CIRCLES,
+    }
+
+
+@app.get("/api/care/circles")
+async def care_circles(request: Request):
+    user = await _care_user(request)
+    return {"circles": await _care_rpc("care_my_circles", {"p_user": user["id"]}) or []}
+
+
+@app.post("/api/care/circles")
+async def care_create_circle(payload: CareCircleIn, request: Request):
+    user = await _care_user(request)
+    _care_write_guard(user["id"])
+    premium = await _user_premium(user["id"], CARE_APP)
+    return await _care_rpc("care_create", {
+        "p_user": user["id"], "p_name": payload.name[:200], "p_display": payload.display_name[:200],
+        "p_max_owned": CARE_PREMIUM_CIRCLES if premium else CARE_FREE_CIRCLES,
+    })
+
+
+@app.post("/api/care/join")
+async def care_join_circle(payload: CareJoinIn, request: Request):
+    user = await _care_user(request)
+    _care_write_guard(user["id"])
+    code = re.sub(r"[^A-Za-z0-9]", "", payload.code).upper()[:12]
+    if len(code) != 8:
+        raise HTTPException(status_code=400, detail="Invite codes are 8 letters and numbers.")
+    found = await _care_rpc("care_code_owner", {"p_code": code})
+    if not found:
+        raise HTTPException(status_code=404, detail=CARE_ERRORS["bad_code"][1])
+    owner_premium = await _user_premium(found["owner"], CARE_APP)
+    return await _care_rpc("care_join", {
+        "p_user": user["id"], "p_code": code, "p_display": payload.display_name[:200],
+        "p_max_members": CARE_PREMIUM_MEMBERS if owner_premium else CARE_FREE_MEMBERS,
+    })
+
+
+@app.get("/api/care/circles/{circle_id}")
+async def care_get_circle(circle_id: str, request: Request):
+    user = await _care_user(request)
+    cid = _uuid_or_400(circle_id)
+    data = await _care_rpc("care_get", {"p_user": user["id"], "p_circle": cid})
+    if not data:
+        raise HTTPException(status_code=404, detail="That circle was deleted.")
+    owner_premium = await _user_premium(data["circle"]["owner"], CARE_APP)
+    data["limits"] = {"premium": owner_premium, "max_members": CARE_PREMIUM_MEMBERS if owner_premium else CARE_FREE_MEMBERS}
+    return data
+
+
+@app.post("/api/care/circles/{circle_id}/items")
+async def care_add_item(circle_id: str, payload: CareItemIn, request: Request):
+    user = await _care_user(request)
+    _care_write_guard(user["id"])
+    if payload.kind not in CARE_REQUIRED:
+        raise HTTPException(status_code=400, detail="Unknown item type.")
+    return await _care_rpc("care_add_item", {
+        "p_user": user["id"], "p_circle": _uuid_or_400(circle_id), "p_kind": payload.kind,
+        "p_data": _care_clean(payload.kind, payload.data),
+        "p_assigned": _uuid_or_400(payload.assigned_to) if payload.assigned_to else None,
+    })
+
+
+@app.post("/api/care/items/{item_id}/update")
+async def care_update_item(item_id: str, payload: CareItemUpdate, request: Request):
+    user = await _care_user(request)
+    _care_write_guard(user["id"])
+    data = None
+    if payload.data is not None:
+        kind = str(payload.data.get("_kind", ""))
+        if kind not in CARE_REQUIRED:
+            raise HTTPException(status_code=400, detail="Unknown item type.")
+        data = _care_clean(kind, payload.data)
+    await _care_rpc("care_update_item", {
+        "p_user": user["id"], "p_item": _uuid_or_400(item_id), "p_data": data, "p_done": payload.done,
+        "p_set_assigned": payload.set_assigned,
+        "p_assigned": _uuid_or_400(payload.assigned_to) if (payload.set_assigned and payload.assigned_to) else None,
+    })
+    return {"ok": True}
+
+
+@app.post("/api/care/items/{item_id}/delete")
+async def care_delete_item(item_id: str, request: Request):
+    user = await _care_user(request)
+    _care_write_guard(user["id"])
+    await _care_rpc("care_delete_item", {"p_user": user["id"], "p_item": _uuid_or_400(item_id)})
+    return {"ok": True}
+
+
+@app.post("/api/care/circles/{circle_id}/card")
+async def care_set_card(circle_id: str, payload: CareCardIn, request: Request):
+    user = await _care_user(request)
+    _care_write_guard(user["id"])
+    await _care_rpc("care_set_card", {"p_user": user["id"], "p_circle": _uuid_or_400(circle_id),
+                                      "p_card": _care_clean("card", payload.card)})
+    return {"ok": True}
+
+
+@app.post("/api/care/circles/{circle_id}/rename")
+async def care_rename_circle(circle_id: str, payload: CareNameIn, request: Request):
+    user = await _care_user(request)
+    _care_write_guard(user["id"])
+    await _care_rpc("care_rename", {"p_user": user["id"], "p_circle": _uuid_or_400(circle_id), "p_name": payload.name[:200]})
+    return {"ok": True}
+
+
+@app.post("/api/care/circles/{circle_id}/code")
+async def care_new_code(circle_id: str, request: Request):
+    user = await _care_user(request)
+    _care_write_guard(user["id"])
+    code = await _care_rpc("care_new_code", {"p_user": user["id"], "p_circle": _uuid_or_400(circle_id)})
+    return {"invite_code": code}
+
+
+@app.post("/api/care/circles/{circle_id}/remove")
+async def care_remove_member(circle_id: str, payload: CareMemberIn, request: Request):
+    user = await _care_user(request)
+    _care_write_guard(user["id"])
+    await _care_rpc("care_remove_member", {"p_user": user["id"], "p_circle": _uuid_or_400(circle_id),
+                                           "p_member": _uuid_or_400(payload.user_id)})
+    return {"ok": True}
+
+
+@app.post("/api/care/circles/{circle_id}/leave")
+async def care_leave_circle(circle_id: str, request: Request):
+    user = await _care_user(request)
+    await _care_rpc("care_leave", {"p_user": user["id"], "p_circle": _uuid_or_400(circle_id)})
+    return {"ok": True}
+
+
+@app.post("/api/care/circles/{circle_id}/delete")
+async def care_delete_circle(circle_id: str, request: Request):
+    user = await _care_user(request)
+    await _care_rpc("care_delete_circle", {"p_user": user["id"], "p_circle": _uuid_or_400(circle_id)})
+    return {"ok": True}
