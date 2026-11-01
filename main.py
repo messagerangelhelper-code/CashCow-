@@ -1191,12 +1191,15 @@ FORWARD_TO = os.environ.get("RECEPTIONIST_FORWARD_TO", "")   # optional: your ce
 VOICE = "Polly.Joanna"
 
 PHONE_APPS = (
-    "ScamShield checks messages, links and phone numbers for scams. "
+    "ScamShield checks messages, links, phone numbers and emails for scams. "
     "MyBillPilot keeps your bills in one place and reminds you when they're due. "
     "My Health Check Scan scans food barcodes for banned ingredients and allergens. "
     "My Home Kitchen Remedies has simple remedies from your kitchen, with safety checks. "
     "My Letter Helper writes letters for billing disputes, refunds and cancellations. "
-    "And My Recall Check checks your car for safety recalls. "
+    "My Recall Check checks your car for safety recalls. "
+    "My Caregiver Circle helps families share appointments, medicines and tasks for a loved one. "
+    "My Fix-It Helper walks you through simple home and car repairs, step by step. "
+    "And My Shopping Helper searches Walmart, Amazon, Target, H-E-B and more with one search. "
     "Most features are free. You'll find them all at cash cow A I dot online."
 )
 
