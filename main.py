@@ -1226,7 +1226,7 @@ async def recall_vehicle(year: int, make: str, model: str, request: Request):
 import base64 as _b64
 import hashlib as _hashlib
 import hmac as _hmac
-from urllib.parse import parse_qs as _parse_qs
+from urllib.parse import parse_qs as _parse_qs, quote
 from fastapi.responses import Response as _Response
 from xml.sax.saxutils import escape as _xml_escape
 
@@ -1918,3 +1918,100 @@ cashcow_mail.register(
     public_api=PUBLIC_API_URL,
     user_premium=lambda uid: _user_premium(uid, "scamshield"),
 )
+
+
+# --- ScamShield "My Data Exposure": has this email shown up in a data breach? ---
+# Uses Have I Been Pwned (haveibeenpwned.com, key in HIBP_API_KEY). Premium only:
+# ScamShield Premium or CashCow All Access, proven by a signed-in account or by the
+# Stripe checkout session saved on the phone of someone who bought without an account.
+HIBP_API_KEY = os.getenv("HIBP_API_KEY", "").strip()
+_EXPOSURE_LOG: dict = {}
+EXPOSURE_LIMIT = 10            # lookups per person per hour
+_TAG_RE = re.compile(r"<[^>]+>")
+
+
+class ExposureIn(BaseModel):
+    email: str
+    session_id: str = ""
+
+
+def _exposure_rate(key: str):
+    now = time.time()
+    hits = [t for t in _EXPOSURE_LOG.get(key, []) if now - t < 3600]
+    if len(hits) >= EXPOSURE_LIMIT:
+        raise HTTPException(status_code=429, detail="You've run 10 exposure checks this hour. Please try again later.")
+    hits.append(now)
+    _EXPOSURE_LOG[key] = hits
+
+
+async def _session_premium(session_id: str, app_name: str) -> bool:
+    if not STRIPE_SECRET_KEY or not re.fullmatch(r"cs_(test|live)_[A-Za-z0-9]{10,200}", session_id or ""):
+        return False
+    try:
+        session = await asyncio.to_thread(stripe.checkout.Session.retrieve, session_id, expand=["subscription"])
+    except stripe.error.StripeError:
+        return False
+    bought = (session.get("metadata") or {}).get("app")
+    if bought not in (app_name, "allaccess"):
+        return False
+    paid = session.get("status") == "complete" and session.get("payment_status") in ("paid", "no_payment_required")
+    sub = session.get("subscription")
+    if sub and not isinstance(sub, str):
+        return paid and sub.get("status") in ("active", "trialing", "past_due")
+    return paid
+
+
+@app.post("/api/data-exposure")
+async def data_exposure(payload: ExposureIn, request: Request):
+    email = (payload.email or "").strip().lower()
+    if not re.fullmatch(r"[^@\s]{1,64}@[^@\s]{1,190}\.[a-z]{2,24}", email):
+        raise HTTPException(status_code=400, detail="Type a full email address, like name@example.com.")
+    if not HIBP_API_KEY:
+        raise HTTPException(status_code=503, detail="The breach check isn't switched on yet. Please try again later.")
+
+    user = await account_user(request.headers.get("authorization", ""))
+    premium = bool(user) and await _user_premium(user["id"], "scamshield")
+    if not premium and payload.session_id:
+        premium = await _session_premium(payload.session_id, "scamshield")
+    if not premium:
+        raise HTTPException(status_code=402, detail="The breach check is part of ScamShield Premium and CashCow All Access.")
+
+    ip = request.client.host if request.client else "unknown"
+    _exposure_rate(user["id"] if user else f"ip:{ip}")
+    own = bool(user) and user.get("email", "").lower() == email
+
+    try:
+        async with httpx.AsyncClient(timeout=12) as client:
+            resp = await client.get(
+                f"https://haveibeenpwned.com/api/v3/breachedaccount/{quote(email)}",
+                params={"truncateResponse": "false"},
+                headers={"hibp-api-key": HIBP_API_KEY, "user-agent": "CashCow-ScamShield"},
+            )
+    except httpx.HTTPError:
+        raise HTTPException(status_code=502, detail="Couldn't reach the breach database. Try again in a minute.")
+    if resp.status_code == 404:
+        return {"email": email, "breaches": [], "hidden": 0}
+    if resp.status_code == 429:
+        raise HTTPException(status_code=429, detail="The breach database is busy. Try again in a minute.")
+    if resp.status_code != 200:
+        logger.error("HIBP lookup failed: %s", resp.status_code)
+        raise HTTPException(status_code=502, detail="The breach check isn't working right now. Try again later.")
+
+    breaches, hidden = [], 0
+    for b in resp.json():
+        # Sensitive breaches (for example adult sites) are shown only for the account's own email.
+        if b.get("IsSensitive") and not own:
+            hidden += 1
+            continue
+        if b.get("IsSpamList"):
+            continue
+        breaches.append({
+            "title": b.get("Title") or b.get("Name", ""),
+            "domain": b.get("Domain", ""),
+            "date": b.get("BreachDate", ""),
+            "data": (b.get("DataClasses") or [])[:12],
+            "about": _TAG_RE.sub("", b.get("Description") or "")[:400],
+            "verified": bool(b.get("IsVerified")),
+        })
+    breaches.sort(key=lambda x: x["date"], reverse=True)
+    return {"email": email, "breaches": breaches[:60], "hidden": hidden}
