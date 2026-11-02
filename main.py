@@ -1,10 +1,13 @@
 import os
+import asyncio
+from typing import Optional
 import re
 import logging
 import time
 import httpx
 import stripe
 import smtplib
+from email.utils import formataddr
 from email.message import EmailMessage
 from datetime import datetime, timezone
 from fastapi import FastAPI, Request, HTTPException
@@ -334,31 +337,31 @@ SITE_URL = "https://cashcowai.online"
 # secret key — change a price here and it takes effect on the next
 # checkout, no dashboard trip required.
 PLANS = {
-    # The bundle plans below aren't connected to any app yet, so they can't be bought
-    # ("enabled": False). They'll become CashCow All Access once accounts are in every app.
+    # --- CashCow All Access: Premium in every CashCow app, including ScamShield Premium.
+    # Needs a signed-in CashCow account, because it unlocks Premium across apps.
     "rent": {
-        "enabled": False,
         "label": "Monthly",
-        "name": "CashCow App Subscription — Monthly",
+        "name": "CashCow All Access — Monthly",
         "amount": 2900,      # $29.00, in cents
         "mode": "subscription",
         "interval": "month",
+        "grants": "allaccess",
     },
     "lease": {
-        "enabled": False,
         "label": "Yearly",
-        "name": "CashCow App Subscription — Yearly",
+        "name": "CashCow All Access — Yearly",
         "amount": 24900,     # $249.00
         "mode": "subscription",
         "interval": "year",
+        "grants": "allaccess",
     },
     "buy": {
-        "enabled": False,
         "label": "Lifetime",
-        "name": "CashCow App — Lifetime Access",
+        "name": "CashCow All Access — Lifetime",
         "amount": 49900,     # $499.00
         "mode": "payment",
         "interval": None,
+        "grants": "allaccess",
     },
     # --- MyBillPilot Premium (sold separately, returns to the MyBillPilot app) ---
     "mbp_monthly": {
@@ -571,6 +574,32 @@ PLANS = {
     },
 }
 
+# What each purchase includes, shown under the plan name on Stripe's checkout page.
+PLAN_INCLUDES = {
+    "allaccess": "Premium in every CashCow app with a CashCow sign-in: ScamShield Premium (unlimited checks and Email Guard), "
+                 "My Health Check Scan, My Home Kitchen Remedies, My Letter Helper, My Recall Check, My Caregiver Circle, "
+                 "My Fix-It Helper, My Shopping Helper, and every new CashCow app. Sign in with the same CashCow account in any app.",
+    "mybillpilot": "Unlimited bills and kids, plus every MyBillPilot Premium feature.",
+    "healthscan": "Healthier swaps with side-by-side comparisons, your avoid list, and your full scan history.",
+    "homeremedy": "My Remedies (save favorites), My Kitchen (see what you can make now), and a shopping list.",
+    "letterhelper": "My Letters: save every letter, track sent dates, and get follow-up reminders.",
+    "recallcheck": "Save up to 10 vehicles in My Garage, each re-checked for new recalls automatically.",
+    "caregiver": "Circles of up to 10 people, up to 3 circles, and a printable care card. Covers everyone in your circle.",
+    "fixit": "My Home: saved projects, a repair log with costs, and home maintenance reminders.",
+    "shopping": "More lists, price notes with the best price you found, and restock reminders.",
+    "scamshield": "Unlimited scam checks in every ScamShield tool, plus Email Guard automatic email protection.",
+}
+
+
+def plan_description(plan: dict) -> str:
+    what = PLAN_INCLUDES.get(plan.get("grants") or plan.get("app") or "", "")
+    if plan["mode"] == "payment":
+        term = "One-time payment, yours for life."
+    else:
+        term = f"Renews every {plan['interval']} until you cancel. Cancel anytime."
+    return (what + " " + term).strip()
+
+
 MYBILLPILOT_URL = os.environ.get("MYBILLPILOT_URL", "https://mybillpilot.onrender.com")
 HEALTHSCAN_URL = os.environ.get("HEALTHSCAN_URL", "https://my-health-check-scan.onrender.com")
 REMEDIES_URL = os.environ.get("REMEDIES_URL", "https://my-home-kitchen-remedies.onrender.com")
@@ -594,9 +623,19 @@ APP_URLS = {
     "scamshield": GUARD_URL,
 }
 
+# Other places a checkout can start from, so people land back where they began.
+RETURN_URLS = {
+    **APP_URLS,
+    "scamshield_web": os.environ.get("SCAMSHIELD_WEB_URL", "https://scamshield-app-x89o.onrender.com"),
+    "scamguard": os.environ.get("SCAMGUARD_URL", "https://scamguard-global.onrender.com"),
+}
+# Premium that apps can ask about: each app's own, plus All Access.
+PREMIUM_KEYS = set(APP_URLS) | {"allaccess"}
+
 
 class CheckoutRequest(BaseModel):
     plan: str
+    return_app: Optional[str] = None
 
     @field_validator("plan")
     @classmethod
@@ -611,7 +650,8 @@ def get_plans():
     # Lets the cart page render live prices/labels without hardcoding
     # them a second time in the frontend.
     return {
-        key: {"label": p["label"], "name": p["name"], "amount": p["amount"], "mode": p["mode"], "interval": p["interval"]}
+        key: {"label": p["label"], "name": p["name"], "amount": p["amount"], "mode": p["mode"], "interval": p["interval"],
+              "description": plan_description(p)}
         for key, p in PLANS.items()
         if not p.get("app") and p.get("enabled", True)  # app plans and unreleased bundle plans aren't listed
     }
@@ -631,24 +671,28 @@ async def create_checkout_session(payload: CheckoutRequest, request: Request):
     # Signed in with a CashCow account? Then the purchase is tied to the account,
     # so Premium works on every device the person signs in on.
     user = await account_user(request.headers.get("authorization", ""))
+    grants = plan.get("app") or plan.get("grants") or "cashcow"
+    if plan.get("grants") == "allaccess" and not user:
+        raise HTTPException(status_code=401, detail="Sign in to your CashCow account first, so All Access can unlock Premium in every app.")
     price_data = {
         "currency": "usd",
-        "product_data": {"name": plan["name"]},
+        "product_data": {"name": plan["name"], "description": plan_description(plan)},
         "unit_amount": plan["amount"],
     }
     if plan["mode"] == "subscription":
         price_data["recurring"] = {"interval": plan["interval"]}
 
-    if plan.get("app") in APP_URLS:
-        # Stripe fills in {CHECKOUT_SESSION_ID}; the app verifies it with /api/verify-session.
-        app_url = APP_URLS[plan["app"]]
+    # Stripe fills in {CHECKOUT_SESSION_ID}; the app or page confirms it with /api/verify-session.
+    back = payload.return_app if payload.return_app in RETURN_URLS else plan.get("app")
+    if back in RETURN_URLS:
+        app_url = RETURN_URLS[back]
         success_url = f"{app_url}/?session_id={{CHECKOUT_SESSION_ID}}"
         cancel_url = f"{app_url}/"
     else:
-        success_url = f"{SITE_URL}/success.html?plan={payload.plan}"
+        success_url = f"{SITE_URL}/success.html?plan={payload.plan}&session_id={{CHECKOUT_SESSION_ID}}"
         cancel_url = f"{SITE_URL}/cart.html?plan={payload.plan}"
 
-    metadata = {"plan": payload.plan, "app": plan.get("app", "cashcow")}
+    metadata = {"plan": payload.plan, "app": grants}
     extra = {}
     if user:
         metadata["user_id"] = user["id"]
@@ -694,10 +738,11 @@ async def verify_session(session_id: str, request: Request, app: str = "mybillpi
     except stripe.error.StripeError:
         raise HTTPException(status_code=502, detail="Couldn't reach Stripe. Try again shortly.")
 
-    if app not in APP_URLS:
+    if app not in PREMIUM_KEYS:
         raise HTTPException(status_code=400, detail="Unknown app.")
     metadata = session.get("metadata") or {}
-    if metadata.get("app") != app:
+    bought = metadata.get("app")
+    if bought != app and bought != "allaccess":
         return {"premium": False, "reason": f"not_{app}"}
 
     paid = session.get("status") == "complete" and session.get("payment_status") in ("paid", "no_payment_required")
@@ -708,9 +753,9 @@ async def verify_session(session_id: str, request: Request, app: str = "mybillpi
 
     # Bought while signed in: remember it on the account.
     if paid and metadata.get("user_id"):
-        await save_entitlement(metadata["user_id"], app, metadata.get("plan", ""), session)
+        await save_entitlement(metadata["user_id"], bought, metadata.get("plan", ""), session)
 
-    return {"premium": bool(paid and active), "plan": metadata.get("plan")}
+    return {"premium": bool(paid and active), "plan": metadata.get("plan"), "via": bought}
 
 
 @app.post("/api/reviews")
@@ -887,7 +932,7 @@ async def claim_purchase(payload: ClaimRequest, request: Request, app: str = "he
         raise HTTPException(status_code=404, detail="Purchase not found.")
     metadata = session.get("metadata") or {}
     paid = session.get("status") == "complete" and session.get("payment_status") in ("paid", "no_payment_required")
-    if metadata.get("app") != app or not paid:
+    if metadata.get("app") not in (app, "allaccess") or not paid:
         raise HTTPException(status_code=400, detail="That purchase isn't for this app.")
     owner = metadata.get("user_id")
     if owner and owner != user["id"]:
@@ -902,7 +947,7 @@ async def claim_purchase(payload: ClaimRequest, request: Request, app: str = "he
         existing = []
     if existing and existing[0].get("user_id") != user["id"]:
         raise HTTPException(status_code=409, detail="That purchase belongs to another account.")
-    await save_entitlement(user["id"], app, metadata.get("plan", ""), session)
+    await save_entitlement(user["id"], metadata.get("app"), metadata.get("plan", ""), session)
     return {"claimed": True}
 
 
@@ -1474,7 +1519,8 @@ _TIME_RE = re.compile(r"^\d{2}:\d{2}$")
 # Allowed fields per kind: (name, max length or "date"/"time").
 CARE_FIELDS = {
     "appointment": [("title", 80), ("date", "date"), ("time", "time"), ("place", 120), ("with", 80), ("notes", 500)],
-    "medicine": [("name", 80), ("dose", 80), ("when", 120), ("purpose", 120), ("prescriber", 80), ("pharmacy", 80), ("notes", 500)],
+    "medicine": [("name", 80), ("dose", 80), ("when", 120), ("purpose", 120), ("prescriber", 80), ("pharmacy", 80),
+                 ("pharmacy_phone", 40), ("rx_number", 40), ("refill_date", "date"), ("notes", 500)],
     "todo": [("title", 120), ("due", "date"), ("notes", 300)],
     "card": [("person", 60), ("birth_date", "date"), ("phone", 40), ("address", 200), ("conditions", 500),
              ("allergies", 300), ("doctors", 500), ("insurance", 300), ("pharmacy", 200), ("contacts", 500),
@@ -1749,6 +1795,113 @@ async def care_delete_circle(circle_id: str, request: Request):
     user = await _care_user(request)
     await _care_rpc("care_delete_circle", {"p_user": user["id"], "p_circle": _uuid_or_400(circle_id)})
     return {"ok": True}
+
+
+# --- One-tap check-ins: "I'm OK", "I need help", mood, and "I need support now" ---
+# Each check-in is saved in the circle (everyone sees it in the app), and the urgent
+# ones are emailed to everyone else in the circle right away.
+CARE_ALERT_LIMIT = 6            # check-ins per person per 10 minutes
+_care_alert_log: dict[str, list[float]] = {}
+CARE_STATUSES = {"ok", "help", "mood", "crisis"}
+CARE_MOODS = {1: "Really low", 2: "Low", 3: "Okay", 4: "Good", 5: "Great"}
+
+
+class CareAlertIn(BaseModel):
+    status: str
+    mood: Optional[int] = None
+    note: str = ""
+    when: str = ""
+    lat: Optional[float] = None
+    lng: Optional[float] = None
+
+
+async def _member_emails(user_ids: list) -> list:
+    out = []
+    async with httpx.AsyncClient(timeout=8) as client:
+        for uid in user_ids:
+            try:
+                r = await client.get(f"{AUTH_SUPABASE_URL}/auth/v1/admin/users/{uid}", headers=_auth_headers())
+                email = (r.json() or {}).get("email") if r.status_code == 200 else None
+            except (httpx.HTTPError, ValueError):
+                email = None
+            if email:
+                out.append(email)
+    return out
+
+
+def _send_circle_email(to: list, subject: str, body: str):
+    if not to or not LEAD_GMAIL_ADDRESS or not LEAD_GMAIL_APP_PASSWORD:
+        return 0
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = formataddr(("My Caregiver Circle", LEAD_GMAIL_ADDRESS))
+    msg["To"] = formataddr(("My Caregiver Circle", LEAD_GMAIL_ADDRESS))
+    msg["Bcc"] = ", ".join(to)
+    msg.set_content(body)
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=10) as smtp:
+        smtp.login(LEAD_GMAIL_ADDRESS, LEAD_GMAIL_APP_PASSWORD)
+        smtp.send_message(msg)
+    return len(to)
+
+
+def _care_alert_text(status: str, who: str, circle_name: str, when: str, note: str, mood: Optional[int], place: str):
+    at = f" at {when}" if when else ""
+    extra = (f"\n\nTheir note: {note}" if note else "") + (f"\n\nTheir location: {place}" if place else "")
+    tail = f"\n\nSent from the {circle_name} circle in My Caregiver Circle: {CAREGIVER_URL}"
+    if status == "help":
+        return (f"🆘 {who} needs help", f"{who} tapped \"I need help\"{at}.{extra}\n\nPlease call or check on them now. "
+                f"If it's an emergency, call 911.{tail}")
+    if status == "crisis":
+        return (f"💜 {who} needs support right now", f"{who} tapped \"I need support now\"{at}. They're having a hard time.{extra}\n\n"
+                f"Please reach out to them now: call, text or go see them. They were shown the 988 Suicide & Crisis Lifeline "
+                f"(call or text 988, free, 24 hours). If you think they're in danger right now, call 911.{tail}")
+    return (f"✅ {who} checked in: I'm OK", f"{who} tapped \"I'm OK\"{at}.{extra}{tail}")
+
+
+@app.post("/api/care/circles/{circle_id}/alert")
+async def care_alert(circle_id: str, payload: CareAlertIn, request: Request):
+    user = await _care_user(request)
+    cid = _uuid_or_400(circle_id)
+    status = payload.status if payload.status in CARE_STATUSES else None
+    if not status:
+        raise HTTPException(status_code=400, detail="That check-in didn't look right. Please try again.")
+    now = time.time()
+    hits = [t for t in _care_alert_log.get(user["id"], []) if now - t < 600]
+    if len(hits) >= CARE_ALERT_LIMIT:
+        raise HTTPException(status_code=429, detail="You've checked in a lot just now. If this is an emergency, call 911.")
+    _care_alert_log[user["id"]] = hits + [now]
+
+    circle = await _care_rpc("care_get", {"p_user": user["id"], "p_circle": cid})
+    if not circle:
+        raise HTTPException(status_code=404, detail="That circle was deleted.")
+    me = next((m for m in circle.get("members", []) if m.get("user_id") == user["id"]), {})
+    who = (me.get("name") or "Someone in your circle")[:60]
+    mood = payload.mood if payload.mood in CARE_MOODS else None
+    note = re.sub(r"[<>]", "", payload.note or "").strip()[:300]
+    when = re.sub(r"[^0-9A-Za-z:,/ .-]", "", payload.when or "")[:40].strip()
+    place = ""
+    data = {"status": status, "name": who}
+    if mood:
+        data["mood"] = mood
+    if note:
+        data["note"] = note
+    if when:
+        data["when"] = when
+    if payload.lat is not None and payload.lng is not None and -90 <= payload.lat <= 90 and -180 <= payload.lng <= 180:
+        data["lat"], data["lng"] = round(payload.lat, 5), round(payload.lng, 5)
+        place = f"https://maps.google.com/?q={data['lat']},{data['lng']}"
+    saved = await _care_rpc("care_add_checkin", {"p_user": user["id"], "p_circle": cid, "p_data": data})
+
+    notified = 0
+    if status in ("ok", "help", "crisis"):
+        others = [m["user_id"] for m in circle.get("members", []) if m.get("user_id") and m["user_id"] != user["id"]]
+        subject, body = _care_alert_text(status, who, circle["circle"].get("name", "your"), when, note, mood, place)
+        try:
+            emails = await _member_emails(others)
+            notified = await asyncio.to_thread(_send_circle_email, emails, subject, body)
+        except Exception as e:  # the check-in is saved even if email fails
+            logger.error("Circle alert email not sent: %s", type(e).__name__)
+    return {"saved": saved, "notified": notified}
 
 
 # --- CashCow Mail: campaigns through Amazon SES, with campaign and inbox scanners ---
