@@ -11,6 +11,7 @@ Render settings (on the CashCow server):
   ECWID_SECRET_TOKEN    the custom app's secret token (secret_...)
   ECOM_ADMIN_EMAILS     CashCow account email(s) allowed in (defaults to MAIL_ADMIN_EMAILS)
   ECOM_MANUAL_SUPPLIERS suppliers you order from by hand (default: CROV)
+  ECOM_AUTO_SUPPLIERS   suppliers whose Ecwid app sends them orders itself (default: Printful)
   ANTHROPIC_API_KEY     turns on the "Ask Claude" tab (key from console.anthropic.com)
   ECOM_CLAUDE_MODEL     optional; which Claude model answers (default: claude-haiku-4-5-20251001)
 
@@ -41,6 +42,8 @@ ECWID_SECRET_TOKEN = (os.environ.get("ECWID_SECRET_TOKEN") or "").strip()
 ECOM_ADMIN_EMAILS = {e.strip().lower() for e in (os.environ.get("ECOM_ADMIN_EMAILS") or os.environ.get("MAIL_ADMIN_EMAILS") or "").split(",") if e.strip()}
 
 # Suppliers with no automatic ordering: their items are always flagged "order by hand".
+# Suppliers whose Ecwid app takes orders on its own (they never go on the To-order list).
+AUTO_SUPPLIERS = {x.strip().lower() for x in (os.environ.get("ECOM_AUTO_SUPPLIERS") or "Printful").split(",") if x.strip()}
 MANUAL_SUPPLIERS = {x.strip().lower() for x in (os.environ.get("ECOM_MANUAL_SUPPLIERS") or "CROV").split(",") if x.strip()}
 ANTHROPIC_API_KEY = (os.environ.get("ANTHROPIC_API_KEY") or "").strip()
 ECOM_CLAUDE_MODEL = (os.environ.get("ECOM_CLAUDE_MODEL") or "claude-haiku-4-5-20251001").strip()
@@ -287,7 +290,8 @@ def route_order(o: dict, wh: list, rules: list, meta: dict) -> dict:
             "supplier": sup or (src[0].get("supplier") if src else None),
             "ships_from": ({"name": src[0]["name"], "city": src[0].get("city"), "state": src[0].get("state"),
                             "miles": src[1], "days": est_days(src[1])} if src else None),
-            "by_hand": bool(sup and (not pool or sup.lower() in MANUAL_SUPPLIERS)),
+            "by_hand": bool(sup and sup.lower() not in AUTO_SUPPLIERS and (not pool or sup.lower() in MANUAL_SUPPLIERS)),
+            "auto": bool(sup and sup.lower() in AUTO_SUPPLIERS),
         })
     return {
         "id": oid,
@@ -442,6 +446,8 @@ def needs_ordering(o: dict) -> list:
     sups = []
     for i in o["items"]:
         sup = i["supplier"] or "Unknown supplier"
+        if sup.lower() in AUTO_SUPPLIERS:
+            continue
         if sup not in sups and not o["ordered"].get(sup):
             sups.append(sup)
     return sups
