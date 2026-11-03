@@ -539,6 +539,11 @@ async def tick(force: bool = False) -> dict:
                 report["processed"] += 1
             if report["processed"]:
                 _cache.pop("orders90", None)
+        try:                      # The Candy Lady: record sales made with a Candy Lady's code
+            import candy
+            report["candy"] = await candy.record_sales(await fetch_orders())
+        except HTTPException:
+            pass                  # candy.sql not run yet
         if st["auto_ribbons"] and time.time() - _running.get("ribbons", 0) > 3600:
             _running["ribbons"] = time.time()
             report["ribbons"] = (await apply_ribbons())["updated"]
@@ -723,6 +728,9 @@ def register(app, *, account_user, auth_headers, supabase_url, logger):
         @on_event("startup")
         async def _start_ecom_loop():
             asyncio.create_task(tick_loop())
+
+    import candy                  # The Candy Lady sellers program (candy.py, candy.sql)
+    candy.register(app, admin=admin, account_user=account_user, logger=logger)
 
     @app.get("/api/ecom/overview")
     async def ecom_overview(request: Request):
