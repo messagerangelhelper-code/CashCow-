@@ -11,6 +11,8 @@ Render settings (on the CashCow server):
   ECWID_SECRET_TOKEN    the custom app's secret token (secret_...)
   ECOM_ADMIN_EMAILS     CashCow account email(s) allowed in (defaults to MAIL_ADMIN_EMAILS)
   ECOM_MANUAL_SUPPLIERS suppliers you order from by hand (default: CROV)
+  ANTHROPIC_API_KEY     turns on the "Ask Claude" tab (key from console.anthropic.com)
+  ECOM_CLAUDE_MODEL     optional; which Claude model answers (default: claude-haiku-4-5-20251001)
 
 Database: ecom.sql (tables ecom_warehouses, ecom_sku_rules, ecom_order_meta).
 ZIP locations: ecom_zips.json, from the "zipcodes" project by Dav Glass (BSD license).
@@ -33,6 +35,11 @@ ECOM_ADMIN_EMAILS = {e.strip().lower() for e in (os.environ.get("ECOM_ADMIN_EMAI
 
 # Suppliers with no automatic ordering: their items are always flagged "order by hand".
 MANUAL_SUPPLIERS = {x.strip().lower() for x in (os.environ.get("ECOM_MANUAL_SUPPLIERS") or "CROV").split(",") if x.strip()}
+ANTHROPIC_API_KEY = (os.environ.get("ANTHROPIC_API_KEY") or "").strip()
+ECOM_CLAUDE_MODEL = (os.environ.get("ECOM_CLAUDE_MODEL") or "claude-haiku-4-5-20251001").strip()
+_ask_log: dict = {}
+ASK_LIMIT = 30   # questions per admin per hour
+
 FULFILLMENT = ["AWAITING_PROCESSING", "PROCESSING", "SHIPPED", "OUT_FOR_DELIVERY", "DELIVERED",
                "READY_FOR_PICKUP", "WILL_NOT_DELIVER", "RETURNED"]
 DONE = {"SHIPPED", "DELIVERED", "WILL_NOT_DELIVER", "RETURNED"}
@@ -283,6 +290,23 @@ class OrderUpdate(BaseModel):
     notes: Optional[str] = None
 
 
+class AskIn(BaseModel):
+    question: str
+    history: list = []
+
+
+ASK_SYSTEM = """You are the assistant inside the CashCow eCommerce control dashboard. The store runs on Ecwid and sells
+furniture, electronics and more from US dropship suppliers (CJdropshipping, CROV and others). The dashboard matches each
+order's ZIP code to the nearest supplier warehouse (where items ship from) and the nearest local logistics hub (which
+handles delivery in that area), and groups open orders into delivery routes by hub. CROV items are always ordered by hand
+on crov.com.
+
+Answer the owner's question using the store data below. Be short and practical: plain sentences or a few bullets, no
+tables, no markdown headings. Quote order numbers, states and dollar amounts exactly as given. If the data doesn't answer
+the question, say what's missing. You can't change anything yourself: when an action is needed, say which dashboard tab
+does it (Orders, Routes, Warehouses, Products, ZIP check) or that it's done in Ecwid. Don't invent numbers."""
+
+
 class ProductUpdate(BaseModel):
     price: Optional[float] = None
     quantity: Optional[int] = None
@@ -498,3 +522,84 @@ def register(app, *, account_user, auth_headers, supabase_url, logger):
             raise HTTPException(status_code=400, detail="Nothing to change.")
         await ecwid("PUT", f"/products/{pid}", body=change)
         return {"ok": True}
+
+    async def store_snapshot() -> str:
+        """Compact store data for Claude: no street addresses, phones, emails or names."""
+        orders, wh = await routed()
+        _, rules, _ = await load_setup()
+        lines = [f"Today (UTC): {time.strftime('%Y-%m-%d %H:%M')}"]
+        lines.append(f"Warehouses ({len(wh)}):")
+        for w in wh:
+            lines.append(f"- {w['name']} | {'local hub' if w.get('kind') == 'logistics' else 'supplier: ' + (w.get('supplier') or '?')}"
+                         f" | {w.get('city')}, {w.get('state')} {w.get('zip')} | {'active' if w.get('active') else 'off'}"
+                         f"{' | carries ' + w['categories'] if w.get('categories') else ''}")
+        lines.append("SKU rules: " + (", ".join(f"{r['match']}->{r['supplier']}" for r in rules) or "none"))
+        lines.append(f"Orders from the last 90 days ({len(orders)}), newest first:")
+        for o in sorted(orders, key=lambda x: x["created"] or "", reverse=True)[:150]:
+            items = "; ".join(
+                f"{i['quantity']}x {i['name']} ({i['sku'] or 'no sku'}, supplier {i['supplier'] or '?'}"
+                f"{', BY HAND' if i['by_hand'] else ''}"
+                f"{', ships from ' + i['ships_from']['name'] + ' ' + str(i['ships_from']['miles']) + 'mi ' + i['ships_from']['days'] if i['ships_from'] else ''})"
+                for i in o["items"])
+            lines.append(f"- #{o['number']} | {o['created']} | ${o['total']} | pay {o['payment']} | {o['status']}"
+                         f" | {(zip_point(o['zip']) or {}).get('city', '?')}, {o['state']} {o['zip']}"
+                         f" | hub {o['hub']['name'] + ' ' + str(o['hub']['miles']) + 'mi' if o['hub'] else 'NONE'}"
+                         f"{' | tracking ' + o['tracking'] if o['tracking'] else ''} | {items}")
+        try:
+            page = await ecwid("GET", "/products", params={"limit": 100})
+            prods = page.get("items") or []
+            lines.append(f"Products (first {len(prods)} of {page.get('total', len(prods))}):")
+            for p in prods:
+                lines.append(f"- {p.get('name')} | sku {p.get('sku')} | ${p.get('price')} | "
+                             f"{'unlimited' if p.get('unlimited') else 'stock ' + str(p.get('quantity'))} | "
+                             f"{'for sale' if p.get('enabled', True) else 'hidden'} | supplier {supplier_for(p.get('sku'), rules) or '?'}")
+        except HTTPException:
+            lines.append("Products: couldn't load.")
+        return "\n".join(lines)[:60000]
+
+    @app.get("/api/ecom/ask")
+    async def ecom_ask_status(request: Request):
+        await admin(request)
+        return {"ready": bool(ANTHROPIC_API_KEY)}
+
+    @app.post("/api/ecom/ask")
+    async def ecom_ask(payload: AskIn, request: Request):
+        user = await admin(request)
+        if not ANTHROPIC_API_KEY:
+            raise HTTPException(status_code=503, detail="Ask Claude isn't switched on yet. Add ANTHROPIC_API_KEY in Render.")
+        q = clean(payload.question, 1500)
+        if not q:
+            raise HTTPException(status_code=400, detail="Type a question first.")
+        now = time.time()
+        hits = [t for t in _ask_log.get(user["id"], []) if now - t < 3600]
+        if len(hits) >= ASK_LIMIT:
+            raise HTTPException(status_code=429, detail="That's 30 questions this hour. Please try again a bit later.")
+        _ask_log[user["id"]] = hits + [now]
+
+        messages = []
+        for turn in (payload.history or [])[-6:]:
+            if isinstance(turn, dict) and turn.get("role") in ("user", "assistant") and isinstance(turn.get("content"), str):
+                messages.append({"role": turn["role"], "content": turn["content"][:3000]})
+        while messages and messages[0]["role"] != "user":
+            messages.pop(0)
+        if messages and messages[-1]["role"] == "user":
+            messages.pop()
+        snapshot = await store_snapshot()
+        messages.append({"role": "user", "content": f"<store_data>\n{snapshot}\n</store_data>\n\nQuestion: {q}"})
+        try:
+            async with httpx.AsyncClient(timeout=60) as client:
+                r = await client.post("https://api.anthropic.com/v1/messages", json={
+                    "model": ECOM_CLAUDE_MODEL, "max_tokens": 1200, "system": ASK_SYSTEM, "messages": messages,
+                }, headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"})
+        except httpx.HTTPError:
+            raise HTTPException(status_code=502, detail="Couldn't reach Claude. Try again in a minute.")
+        if r.status_code == 401:
+            raise HTTPException(status_code=502, detail="Claude refused the API key. Check ANTHROPIC_API_KEY in Render.")
+        if r.status_code == 429:
+            raise HTTPException(status_code=429, detail="Claude is busy or your spending limit was reached. Try again shortly.")
+        if r.status_code >= 400:
+            logger.error("Ask Claude failed: %s %s", r.status_code, r.text[:300])
+            raise HTTPException(status_code=502, detail="Claude couldn't answer right now. Try again in a minute.")
+        data = r.json()
+        answer = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text").strip()
+        return {"answer": answer or "No answer came back. Try asking another way."}
