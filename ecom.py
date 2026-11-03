@@ -820,6 +820,9 @@ def register(app, *, account_user, auth_headers, supabase_url, logger):
     import candy                  # The Candy Lady sellers program (candy.py, candy.sql)
     candy.register(app, admin=admin, account_user=account_user, logger=logger)
 
+    import cj                     # fill shelves from CJdropshipping (cj.py)
+    cj.register(app, admin=admin, logger=logger)
+
     @app.get("/api/ecom/overview")
     async def ecom_overview(request: Request):
         await admin(request)
