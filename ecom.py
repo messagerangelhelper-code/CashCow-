@@ -73,8 +73,8 @@ SWITCHES = [
      "about": "Products added without a description get one written by Claude. A few cents each."},
     {"key": "hub_texts", "label": "Text each hub its delivery route", "group": "upgrade", "default": False, "coming": True,
      "about": "Morning text with the route link to each hub's phone, through your Twilio number."},
-    {"key": "channels", "label": "Sell on Amazon and eBay", "group": "upgrade", "default": False, "coming": True, "external": True,
-     "about": "Turned on inside Ecwid (Sales channels). Available on Ecwid's higher plans."},
+    {"key": "channels", "label": "Sell everywhere through Ecwid's sales channels", "group": "channels", "default": True, "external": True,
+     "about": "Facebook, Instagram, Google Shopping, TikTok, Amazon, eBay, Walmart, Pinterest and more. Turn each one on in Ecwid → Sales channels. Every channel's orders come into this dashboard automatically, labeled by channel."},
 ]
 
 
@@ -234,6 +234,28 @@ def supplier_for(sku: str, rules) -> Optional[str]:
     return best["supplier"] if best else None
 
 
+CHANNEL_NAMES = {"FACEBOOK": "Facebook", "INSTAGRAM": "Instagram", "GOOGLE": "Google", "GOOGLE_SHOPPING": "Google Shopping",
+                 "TIKTOK": "TikTok", "AMAZON": "Amazon", "EBAY": "eBay", "WALMART": "Walmart", "PINTEREST": "Pinterest",
+                 "SNAPCHAT": "Snapchat", "ETSY": "Etsy", "YAHOO": "Yahoo", "BING": "Microsoft Bing", "MICROSOFT": "Microsoft"}
+
+
+def order_channel(o: dict) -> str:
+    """Where the sale came from, as far as Ecwid tells us."""
+    ext = o.get("externalOrderData") or {}
+    raw = str(ext.get("refererChannel") or ext.get("refererId") or o.get("refererId") or "").strip()
+    if raw:
+        key = re.sub(r"[^A-Z]", "_", raw.upper())
+        for k, name in CHANNEL_NAMES.items():
+            if k in key:
+                return name
+        return raw.replace("_", " ").title()[:40]
+    url = str(o.get("referrerUrl") or o.get("refererUrl") or "").lower()
+    for k, name in CHANNEL_NAMES.items():
+        if k.lower().split("_")[0] in url:
+            return name
+    return "Online store"
+
+
 def route_order(o: dict, wh: list, rules: list, meta: dict) -> dict:
     sp = o.get("shippingPerson") or o.get("billingPerson") or {}
     oid = str(o.get("id") or o.get("orderNumber"))
@@ -283,6 +305,7 @@ def route_order(o: dict, wh: list, rules: list, meta: dict) -> dict:
         "hub": ({"id": hub["id"], "name": hub["name"], "miles": hub_mi} if hub else None),
         "hub_manual": bool(m.get("hub_id")),
         "notes": m.get("notes") or "",
+        "channel": order_channel(o),
         "ordered": m.get("ordered") or {},
         "processed": bool(m.get("processed_at")),
         "ship_to": "\n".join(x for x in [sp.get("name"), sp.get("companyName"), sp.get("street"),
@@ -643,6 +666,11 @@ def register(app, *, account_user, auth_headers, supabase_url, logger):
         cutoff = time.strftime("%Y-%m-%d", time.gmtime(time.time() - 30 * 86400))
         paid30 = [o for o in orders if o["payment"] == "PAID" and (o["created"] or "") >= cutoff]
         states: dict = {}
+        chans: dict = {}
+        for o in paid30:
+            c = chans.setdefault(o["channel"], [0, 0.0])
+            c[0] += 1
+            c[1] = round(c[1] + float(o["total"] or 0), 2)
         for o in orders:
             if o["open"]:
                 states[o["state"] or "?"] = states.get(o["state"] or "?", 0) + 1
@@ -655,6 +683,7 @@ def register(app, *, account_user, auth_headers, supabase_url, logger):
             "sales30": round(sum(float(o["total"] or 0) for o in paid30), 2),
             "orders30": len(paid30),
             "open_by_state": sorted(states.items(), key=lambda kv: -kv[1])[:12],
+            "by_channel": sorted(chans.items(), key=lambda kv: -kv[1][1]),
             "hubs": sum(1 for w in wh if w.get("kind") == "logistics" and w.get("active")),
             "supplier_warehouses": sum(1 for w in wh if w.get("kind") == "supplier" and w.get("active")),
         })
@@ -838,7 +867,7 @@ def register(app, *, account_user, auth_headers, supabase_url, logger):
                 f"{', BY HAND' if i['by_hand'] else ''}"
                 f"{', ships from ' + i['ships_from']['name'] + ' ' + str(i['ships_from']['miles']) + 'mi ' + i['ships_from']['days'] if i['ships_from'] else ''})"
                 for i in o["items"])
-            lines.append(f"- #{o['number']} | {o['created']} | ${o['total']} | pay {o['payment']} | {o['status']}"
+            lines.append(f"- #{o['number']} | {o['created']} | {o['channel']} | ${o['total']} | pay {o['payment']} | {o['status']}"
                          f" | {(zip_point(o['zip']) or {}).get('city', '?')}, {o['state']} {o['zip']}"
                          f" | hub {o['hub']['name'] + ' ' + str(o['hub']['miles']) + 'mi' if o['hub'] else 'NONE'}"
                          f"{' | tracking ' + o['tracking'] if o['tracking'] else ''} | {items}")
