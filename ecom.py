@@ -48,6 +48,36 @@ MANUAL_SUPPLIERS = {x.strip().lower() for x in (os.environ.get("ECOM_MANUAL_SUPP
 ANTHROPIC_API_KEY = (os.environ.get("ANTHROPIC_API_KEY") or "").strip()
 ECOM_CLAUDE_MODEL = (os.environ.get("ECOM_CLAUDE_MODEL") or "claude-haiku-4-5-20251001").strip()
 _ask_log: dict = {}
+# Claude credit tracking (Anthropic doesn't let apps read the balance, so we count what each answer costs).
+PRICE_IN = float(os.environ.get("ECOM_CLAUDE_PRICE_IN") or 1.0)     # $ per million input tokens (Claude Haiku 4.5)
+PRICE_OUT = float(os.environ.get("ECOM_CLAUDE_PRICE_OUT") or 5.0)   # $ per million output tokens
+BILLING_URL = "https://console.anthropic.com/settings/billing"
+
+
+async def note_claude_usage(data: dict = None, empty: bool = False):
+    """Add one Claude answer's cost to the running total; remember if Anthropic said the balance is empty."""
+    try:
+        rows = await db("GET", "ecom_settings", params={"key": "eq._claude_spend", "select": "value"}) or []
+        cur = dict((rows[0].get("value") if rows else None) or {})
+        if data:
+            u = data.get("usage") or {}
+            cost = (u.get("input_tokens", 0) + u.get("cache_creation_input_tokens", 0)) * PRICE_IN / 1e6 \
+                + u.get("cache_read_input_tokens", 0) * PRICE_IN * 0.1 / 1e6 + u.get("output_tokens", 0) * PRICE_OUT / 1e6
+            cur["spent"] = round(float(cur.get("spent") or 0) + cost, 5)
+            cur["calls"] = int(cur.get("calls") or 0) + 1
+        if empty:
+            cur["empty_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        await save_setting("_claude_spend", cur)
+    except HTTPException:
+        pass
+
+
+def claude_out_of_credit(r) -> bool:
+    try:
+        msg = str(((r.json() or {}).get("error") or {}).get("message") or "").lower()
+    except ValueError:
+        msg = ""
+    return r.status_code in (400, 402, 403) and ("credit balance" in msg or "billing" in msg)
 ASK_LIMIT = 30   # questions per admin per hour
 
 GMAIL = (os.environ.get("LEAD_GMAIL_ADDRESS") or "").strip()
@@ -1086,6 +1116,39 @@ def register(app, *, account_user, auth_headers, supabase_url, logger):
             lines.append("Products: couldn't load.")
         return "\n".join(lines)[:60000]
 
+    @app.get("/api/ecom/claude-credit")
+    async def ecom_claude_credit(request: Request):
+        await admin(request)
+        rows = await db("GET", "ecom_settings", params={"key": "in.(_claude_spend,claude_credit,claude_alert)", "select": "*"}) or []
+        v = {r["key"]: r.get("value") for r in rows}
+        sp = v.get("_claude_spend") or {}
+        credit = v.get("claude_credit") or {}
+        added = float(credit.get("amount") or 0)
+        spent_since = max(0.0, float(sp.get("spent") or 0) - float(credit.get("spent_at_add") or 0))
+        left = round(added - spent_since, 2) if added else None
+        alert = float(v.get("claude_alert") or 2)
+        empty = bool(sp.get("empty_at") and (not credit.get("at") or sp["empty_at"] > credit["at"]))
+        return {"ready": bool(ANTHROPIC_API_KEY), "added": added or None, "spent": round(spent_since, 2), "left": left,
+                "alert": alert, "low": empty or (left is not None and left <= alert), "empty": empty,
+                "calls": int(sp.get("calls") or 0), "billing_url": BILLING_URL}
+
+    class CreditIn(BaseModel):
+        amount: float
+        alert: Optional[float] = None
+
+    @app.post("/api/ecom/claude-credit")
+    async def ecom_claude_credit_set(payload: CreditIn, request: Request):
+        await admin(request)
+        if not 0 < payload.amount <= 10000:
+            raise HTTPException(status_code=400, detail="Enter the dollar amount you have in Claude credit, like 10.")
+        rows = await db("GET", "ecom_settings", params={"key": "eq._claude_spend", "select": "value"}) or []
+        sp = (rows[0].get("value") if rows else None) or {}
+        await save_setting("claude_credit", {"amount": round(payload.amount, 2), "spent_at_add": float(sp.get("spent") or 0),
+                                             "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
+        if payload.alert is not None and 0 <= payload.alert <= 1000:
+            await save_setting("claude_alert", payload.alert)
+        return {"ok": True, "message": f"Got it: ${payload.amount:.2f} of Claude credit. You'll get a reminder when it runs low."}
+
     @app.get("/api/ecom/ask")
     async def ecom_ask_status(request: Request):
         await admin(request)
@@ -1132,6 +1195,9 @@ def register(app, *, account_user, auth_headers, supabase_url, logger):
                 }, headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"})
         except httpx.HTTPError:
             raise HTTPException(status_code=502, detail="Couldn't reach Claude. Try again in a minute.")
+        if claude_out_of_credit(r):
+            await note_claude_usage(empty=True)
+            raise HTTPException(status_code=402, detail="Your Claude credit has run out. Add funds at console.anthropic.com (Billing), then try again.")
         if r.status_code == 401:
             raise HTTPException(status_code=502, detail="Claude refused the API key. Check ANTHROPIC_API_KEY in Render.")
         if r.status_code == 429:
@@ -1140,6 +1206,7 @@ def register(app, *, account_user, auth_headers, supabase_url, logger):
             logger.error("Ask Claude failed: %s %s", r.status_code, r.text[:300])
             raise HTTPException(status_code=502, detail="Claude couldn't answer right now. Try again in a minute.")
         data = r.json()
+        await note_claude_usage(data)
         answer = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text").strip()
         actions = [{"type": b["name"], "input": b.get("input") or {}, "summary": action_summary(b["name"], b.get("input") or {})}
                    for b in data.get("content", []) if b.get("type") == "tool_use" and b.get("name") in {t["name"] for t in ASK_TOOLS}]

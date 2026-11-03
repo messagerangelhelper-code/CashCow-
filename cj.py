@@ -139,6 +139,10 @@ async def nice_copy(name: str, raw: str) -> tuple:
             r = await client.post("https://api.anthropic.com/v1/messages", json={
                 "model": ecom.ECOM_CLAUDE_MODEL, "max_tokens": 300, "messages": [{"role": "user", "content": prompt}]},
                 headers={"x-api-key": ecom.ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01"})
+        if ecom.claude_out_of_credit(r):
+            await ecom.note_claude_usage(empty=True)
+            return name[:120], raw[:600]
+        await ecom.note_claude_usage(r.json())
         text = "".join(b.get("text", "") for b in r.json().get("content", []) if b.get("type") == "text")
         t = re.search(r"TITLE:\s*(.+)", text)
         dsc = re.search(r"DESCRIPTION:\s*(.+)", text, re.S)
