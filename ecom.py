@@ -291,8 +291,10 @@ class OrderUpdate(BaseModel):
 
 
 class AskIn(BaseModel):
-    question: str
+    question: str = ""
     history: list = []
+    image: str = ""          # optional photo, base64 (JPEG/PNG/WebP), from the camera button
+    image_type: str = ""
 
 
 ASK_SYSTEM = """You are the assistant inside the CashCow eCommerce control dashboard. The store runs on Ecwid and sells
@@ -303,7 +305,9 @@ on crov.com.
 
 Answer the owner's question using the store data below. Be short and practical: plain sentences or a few bullets, no
 tables, no markdown headings. Quote order numbers, states and dollar amounts exactly as given. If the data doesn't answer
-the question, say what's missing. You can't change anything yourself: when an action is needed, say which dashboard tab
+the question, say what's missing. When a photo is attached (a product, label, packing slip, invoice or screenshot), read it
+carefully and use what you see: for a product, suggest a store title, a short description, a likely category and a sensible
+SKU start for its supplier. You can't change anything yourself: when an action is needed, say which dashboard tab
 does it (Orders, Routes, Warehouses, Products, ZIP check) or that it's done in Ecwid. Don't invent numbers."""
 
 
@@ -568,8 +572,15 @@ def register(app, *, account_user, auth_headers, supabase_url, logger):
         if not ANTHROPIC_API_KEY:
             raise HTTPException(status_code=503, detail="Ask Claude isn't switched on yet. Add ANTHROPIC_API_KEY in Render.")
         q = clean(payload.question, 1500)
+        img = None
+        if payload.image:
+            if payload.image_type not in ("image/jpeg", "image/png", "image/webp") or len(payload.image) > 7_000_000 \
+                    or not re.fullmatch(r"[A-Za-z0-9+/=]+", payload.image[:2000]):
+                raise HTTPException(status_code=400, detail="That photo couldn't be read. Try taking it again.")
+            img = {"type": "image", "source": {"type": "base64", "media_type": payload.image_type, "data": payload.image}}
+            q = q or "What is in this photo? Help me use it for my store."
         if not q:
-            raise HTTPException(status_code=400, detail="Type a question first.")
+            raise HTTPException(status_code=400, detail="Type a question or add a photo first.")
         now = time.time()
         hits = [t for t in _ask_log.get(user["id"], []) if now - t < 3600]
         if len(hits) >= ASK_LIMIT:
@@ -585,7 +596,8 @@ def register(app, *, account_user, auth_headers, supabase_url, logger):
         if messages and messages[-1]["role"] == "user":
             messages.pop()
         snapshot = await store_snapshot()
-        messages.append({"role": "user", "content": f"<store_data>\n{snapshot}\n</store_data>\n\nQuestion: {q}"})
+        text = {"type": "text", "text": f"<store_data>\n{snapshot}\n</store_data>\n\nQuestion: {q}"}
+        messages.append({"role": "user", "content": [img, text] if img else [text]})
         try:
             async with httpx.AsyncClient(timeout=60) as client:
                 r = await client.post("https://api.anthropic.com/v1/messages", json={
