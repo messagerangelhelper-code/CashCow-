@@ -139,6 +139,35 @@ class CandySettingsIn(BaseModel):
     bonus: Optional[float] = None
 
 
+async def make_coupon(code: str, name: str, discount: float) -> dict:
+    return await ecwid("POST", "/discount_coupons", body={
+        "name": f"Candy Lady {name}"[:100], "code": code, "discountType": "PERCENT", "discount": discount,
+        "status": "ACTIVE", "usesLimit": "UNLIMITED", "applicationLimit": "UNLIMITED"})
+
+
+_retry = {"at": 0.0}
+
+
+async def activate_waiting_codes() -> int:
+    """Hourly: make the Ecwid coupon for Candy Ladies who joined before the store could have coupons."""
+    if time.time() - _retry["at"] < 3600:
+        return 0
+    _retry["at"] = time.time()
+    waiting = await db("GET", "candy_sellers", params={"select": "*", "coupon_id": "is.null", "status": "eq.active"}) or []
+    if not waiting:
+        return 0
+    st = await candy_settings()
+    done = 0
+    for s in waiting:
+        try:
+            made = await make_coupon(s["code"], s["name"], st["candy_discount"])
+        except HTTPException:
+            break                  # still not allowed: try again next hour
+        await db("PATCH", "candy_sellers", params={"id": f"eq.{s['id']}"}, body={"coupon_id": made.get("id")}, prefer="return=minimal")
+        done += 1
+    return done
+
+
 async def set_coupon(seller: dict, status: str = "", discount: float = None):
     if not seller.get("coupon_id"):
         return
@@ -186,6 +215,7 @@ def register(app, *, admin, account_user, logger):
             payouts = await db("GET", "candy_payouts", params={"seller_id": f"eq.{s['id']}", "select": "amount,method,paid_at",
                                                                "order": "paid_at.desc", "limit": "20"}) or []
             out["seller"] = {k: s.get(k) for k in ("name", "code", "status", "payout_method", "payout_handle", "created_at")}
+            out["seller"]["waiting"] = not s.get("coupon_id")
             out.update(totals=t, sales=sales, payouts=payouts)
         return out
 
@@ -208,18 +238,20 @@ def register(app, *, admin, account_user, logger):
         if taken:
             raise HTTPException(status_code=409, detail="That code is taken. Try another, like adding your street or a number.")
         st = await candy_settings()
+        made, waiting = {}, False
         try:
-            made = await ecwid("POST", "/discount_coupons", body={
-                "name": f"Candy Lady {name}"[:100], "code": code, "discountType": "PERCENT", "discount": st["candy_discount"],
-                "status": "ACTIVE", "usesLimit": "UNLIMITED", "applicationLimit": "UNLIMITED"})
-        except HTTPException:
-            raise HTTPException(status_code=409, detail="That code couldn't be made. It may already exist in the store; try another.")
+            made = await make_coupon(code, name, st["candy_discount"])
+        except HTTPException as e:
+            logger.error("Candy Lady code %s not made: %s", code, e.detail)
+            if "already" in str(e.detail).lower() or "exist" in str(e.detail).lower():
+                raise HTTPException(status_code=409, detail="That code already exists in the store. Try another.")
+            waiting = True     # e.g. the store's plan doesn't include coupons yet: save her, switch the code on later
         await db("POST", "candy_sellers", body={
             "user_id": user["id"], "email": user.get("email") or "", "name": name, "code": code, "coupon_id": made.get("id"),
             "phone": clean(payload.phone, 30), "payout_method": payload.payout_method,
             "payout_handle": clean(payload.payout_handle, 80), "status": "active"}, prefer="return=minimal")
-        logger.info("New Candy Lady joined: %s", code)
-        return {"ok": True, "code": code}
+        logger.info("New Candy Lady joined: %s%s", code, " (code waiting for Ecwid)" if waiting else "")
+        return {"ok": True, "code": code, "waiting": waiting}
 
     @app.post("/api/candy/me")
     async def candy_update_me(payload: SellerUpdate, request: Request):
@@ -246,7 +278,9 @@ def register(app, *, admin, account_user, logger):
         empty = {"orders": 0, "pending": 0, "owed": 0, "paid": 0, "lifetime": 0}
         rows = [{**{k: s.get(k) for k in ("id", "name", "code", "email", "phone", "status", "payout_method", "payout_handle", "created_at")},
                  **totals.get(s["id"], empty)} for s in sellers]
+        ids_waiting = {s["id"] for s in sellers if not s.get("coupon_id")}
         for r in rows:
+            r["waiting"] = r["id"] in ids_waiting
             r["credit"] = credit_value(r["owed"], st["candy_credit_bonus"]) if r.get("payout_method") == CREDIT else None
         return {"settings": st, "sellers": rows, "min_payout": MIN_PAYOUT,
                 "to_pay": [r for r in rows if r["owed"] >= MIN_PAYOUT and r["status"] == "active"]}

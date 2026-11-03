@@ -167,12 +167,21 @@ async def ecwid(method: str, path: str, params=None, body=None):
     except httpx.HTTPError:
         raise HTTPException(status_code=502, detail="Couldn't reach Ecwid. Try again in a minute.")
     if r.status_code in (401, 403):
+        _ctx["logger"].error("Ecwid %s %s refused (%s): %s", method, path, r.status_code, r.text[:300])
+        if r.status_code == 403 and path != "/profile":
+            raise HTTPException(status_code=502, detail=f"Ecwid said this store or app isn't allowed to do that ({path.split('/')[1]}). "
+                                                          "Your Ecwid plan may not include it, or the custom app is missing that permission.")
         raise HTTPException(status_code=502, detail="Ecwid refused the token. Check ECWID_STORE_ID and ECWID_SECRET_TOKEN in Render.")
     if r.status_code == 404:
         raise HTTPException(status_code=404, detail="Not found in Ecwid.")
     if r.status_code >= 400:
-        _ctx["logger"].error("Ecwid %s %s failed: %s", method, path, r.status_code)
-        raise HTTPException(status_code=502, detail=f"Ecwid said no ({r.status_code}).")
+        _ctx["logger"].error("Ecwid %s %s failed: %s %s", method, path, r.status_code, r.text[:300])
+        msg = ""
+        try:
+            msg = str((r.json() or {}).get("errorMessage") or "")[:200]
+        except ValueError:
+            pass
+        raise HTTPException(status_code=502, detail=f"Ecwid said no ({r.status_code}){': ' + msg if msg else ''}.")
     try:
         return r.json()
     except ValueError:
@@ -548,6 +557,7 @@ async def tick(force: bool = False) -> dict:
         try:                      # The Candy Lady: record sales made with a Candy Lady's code
             import candy
             report["candy"] = await candy.record_sales(await fetch_orders())
+            report["candy_codes"] = await candy.activate_waiting_codes()
         except HTTPException:
             pass                  # candy.sql not run yet
         if st["auto_ribbons"] and time.time() - _running.get("ribbons", 0) > 3600:
