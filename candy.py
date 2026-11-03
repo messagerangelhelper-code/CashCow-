@@ -9,20 +9,25 @@ PayPal, Zelle) and mark them paid in the dashboard.
 
 Database: candy.sql. Settings live in ecom_settings (candy_discount, candy_cut, candy_url).
 """
+import asyncio
 import re
+import secrets
 import time
 
 from fastapi import HTTPException, Request
+from typing import Optional
+
 from pydantic import BaseModel
 
 import ecom
 from ecom import db, ecwid, clean, save_setting
 
-DEFAULTS = {"candy_discount": 5, "candy_cut": 10, "candy_url": ""}
+DEFAULTS = {"candy_discount": 5, "candy_cut": 10, "candy_url": "", "candy_credit_bonus": 20}
 PAYABLE = {"SHIPPED", "OUT_FOR_DELIVERY", "DELIVERED", "READY_FOR_PICKUP"}     # earned once it's on its way
 VOID = {"WILL_NOT_DELIVER", "RETURNED"}
 MIN_PAYOUT = 10.0
-PAYOUT_METHODS = ["Cash App", "PayPal", "Zelle", "Venmo", "Check"]
+CREDIT = "Store credit"
+PAYOUT_METHODS = [CREDIT, "Cash App", "PayPal", "Zelle", "Venmo", "Check"]
 _ctx: dict = {}
 
 
@@ -32,7 +37,12 @@ async def candy_settings() -> dict:
     out = {k: vals.get(k, v) for k, v in DEFAULTS.items()}
     out["candy_discount"] = float(out["candy_discount"] or 0)
     out["candy_cut"] = float(out["candy_cut"] or 0)
+    out["candy_credit_bonus"] = float(out["candy_credit_bonus"] or 0)
     return out
+
+
+def credit_value(owed: float, bonus_pct: float) -> float:
+    return round(owed * (1 + bonus_pct / 100), 2)
 
 
 def order_code(o: dict) -> str:
@@ -126,6 +136,7 @@ class CandySettingsIn(BaseModel):
     discount: float
     cut: float
     url: str = ""
+    bonus: Optional[float] = None
 
 
 async def set_coupon(seller: dict, status: str = "", discount: float = None):
@@ -160,6 +171,7 @@ def register(app, *, admin, account_user, logger):
         st = await candy_settings()
         s = await my_seller(user)
         out = {"discount": st["candy_discount"], "cut": st["candy_cut"], "methods": PAYOUT_METHODS, "min_payout": MIN_PAYOUT,
+               "credit_bonus": st["candy_credit_bonus"],
                "shop_url": st["candy_url"] or "", "seller": None}
         if not out["shop_url"] and ecom.ecwid_ready():
             try:
@@ -234,6 +246,8 @@ def register(app, *, admin, account_user, logger):
         empty = {"orders": 0, "pending": 0, "owed": 0, "paid": 0, "lifetime": 0}
         rows = [{**{k: s.get(k) for k in ("id", "name", "code", "email", "phone", "status", "payout_method", "payout_handle", "created_at")},
                  **totals.get(s["id"], empty)} for s in sellers]
+        for r in rows:
+            r["credit"] = credit_value(r["owed"], st["candy_credit_bonus"]) if r.get("payout_method") == CREDIT else None
         return {"settings": st, "sellers": rows, "min_payout": MIN_PAYOUT,
                 "to_pay": [r for r in rows if r["owed"] >= MIN_PAYOUT and r["status"] == "active"]}
 
@@ -249,6 +263,10 @@ def register(app, *, admin, account_user, logger):
         await save_setting("candy_discount", payload.discount)
         await save_setting("candy_cut", payload.cut)
         await save_setting("candy_url", url)
+        if payload.bonus is not None:
+            if not 0 <= payload.bonus <= 100:
+                raise HTTPException(status_code=400, detail="Use a bonus from 0 to 100 percent.")
+            await save_setting("candy_credit_bonus", payload.bonus)
         changed = 0
         if payload.discount != old["candy_discount"]:
             for s in await db("GET", "candy_sellers", params={"select": "*", "status": "eq.active"}) or []:
@@ -284,10 +302,32 @@ def register(app, *, admin, account_user, logger):
         amount = round(sum(float(d["earned"] or 0) for d in due), 2)
         if amount <= 0:
             raise HTTPException(status_code=400, detail="Nothing is owed right now.")
-        made = await db("POST", "candy_payouts", body={"seller_id": sid, "amount": amount, "method": rows[0].get("payout_method") or "",
+        seller = rows[0]
+        method = seller.get("payout_method") or ""
+        note = ""
+        if method == CREDIT:
+            st = await candy_settings()
+            value = credit_value(amount, st["candy_credit_bonus"])
+            code = f"CL{seller['code'][:8]}{secrets.token_hex(2).upper()}"
+            await ecwid("POST", "/discount_coupons", body={
+                "name": f"Candy Lady store credit · {seller['name']}"[:100], "code": code, "discountType": "ABS",
+                "discount": value, "status": "ACTIVE", "usesLimit": "SINGLE", "applicationLimit": "UNLIMITED"})
+            method = f"{CREDIT} · code {code} · ${value:.2f}"
+            note = f" as a ${value:.2f} store credit code {code}"
+            if seller.get("email"):
+                body = (f"Hi {seller['name']},\n\nThank you for being a Candy Lady! Your ${amount:.2f} in earnings is now "
+                        f"${value:.2f} of store credit.\n\nYour store credit code: {code}\n\nType it at checkout. It's good for one order "
+                        f"up to ${value:.2f}, and any amount left over doesn't carry over, so fill your cart!\n\n"
+                        + (f"Shop here: {st['candy_url']}\n\n" if st["candy_url"] else "") + "The Candy Lady")
+                try:
+                    sent = await ecom.send_email([seller["email"]], f"🍬 Your ${value:.2f} Candy Lady store credit", body)
+                    note += " and emailed it to her" if sent else " (the email didn't send; give her the code)"
+                except Exception:
+                    note += " (the email didn't send; give her the code)"
+        made = await db("POST", "candy_payouts", body={"seller_id": sid, "amount": amount, "method": method,
                                                        "order_ids": [d["order_id"] for d in due]}, prefer="return=representation")
         pid = (made or [{}])[0].get("id")
         ids = ",".join(f'"{d["order_id"]}"' for d in due)
         await db("PATCH", "candy_sales", params={"order_id": f"in.({ids})"}, body={"paid_out": True, "payout_id": pid},
                  prefer="return=minimal")
-        return {"ok": True, "message": f"Recorded ${amount:.2f} paid to {rows[0]['name']}."}
+        return {"ok": True, "message": f"Recorded ${amount:.2f} paid to {seller['name']}{note}."}

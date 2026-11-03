@@ -647,10 +647,11 @@ SECTIONS = {
                                "Kitchen & Dish", "Laundry", "First Aid & Personal Care"]},
     "candy": {"name": "The Candy Lady", "icon": "🍬",
               "about": "Candy, snacks, drinks and party treats, shipped to your door.",
-              "shelves": ["Candy", "Nostalgia Candy", "Snacks", "Drinks & Treats", "Freeze-Dried Treats", "Party & Dollar Items"]},
+              "shelves": ["Candy", "Nostalgia Candy", "Snacks", "Drinks & Treats", "Freeze-Dried Treats", "Party & Dollar Items",
+                          "Party Supplies", "Goodie Bags & Favors", "Balloons & Decorations"]},
     "candles": {"name": "Candles", "icon": "🕯️",
                 "about": "Hand-poured and custom-label scented candles.",
-                "shelves": ["Scented Candles", "Gift Sets", "Wax Melts"]},
+                "shelves": ["Scented Candles", "Holiday Candles", "Carved & Pillar Candles", "Gift Sets", "Wax Melts"]},
 }
 
 
