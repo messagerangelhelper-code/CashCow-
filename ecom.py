@@ -14,16 +14,23 @@ Render settings (on the CashCow server):
   ANTHROPIC_API_KEY     turns on the "Ask Claude" tab (key from console.anthropic.com)
   ECOM_CLAUDE_MODEL     optional; which Claude model answers (default: claude-haiku-4-5-20251001)
 
-Database: ecom.sql (tables ecom_warehouses, ecom_sku_rules, ecom_order_meta).
+Database: ecom.sql, then ecom2.sql (adds ecom_settings and order tracking columns).
+Daily email uses the Gmail settings the server already has (LEAD_GMAIL_ADDRESS, LEAD_GMAIL_APP_PASSWORD).
 ZIP locations: ecom_zips.json, from the "zipcodes" project by Dav Glass (BSD license).
 """
+import asyncio
 import json
 import math
+import smtplib
 import os
 import re
 import time
+from datetime import datetime, timedelta
+from email.message import EmailMessage
+from email.utils import formataddr
 from pathlib import Path
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import httpx
 from fastapi import HTTPException, Request
@@ -39,6 +46,48 @@ ANTHROPIC_API_KEY = (os.environ.get("ANTHROPIC_API_KEY") or "").strip()
 ECOM_CLAUDE_MODEL = (os.environ.get("ECOM_CLAUDE_MODEL") or "claude-haiku-4-5-20251001").strip()
 _ask_log: dict = {}
 ASK_LIMIT = 30   # questions per admin per hour
+
+GMAIL = (os.environ.get("LEAD_GMAIL_ADDRESS") or "").strip()
+GMAIL_PASSWORD = (os.environ.get("LEAD_GMAIL_APP_PASSWORD") or "").strip()
+CJ_API_KEY = (os.environ.get("CJ_API_KEY") or "").strip()
+TWILIO_READY = bool(os.environ.get("TWILIO_AUTH_TOKEN"))
+TZ = ZoneInfo(os.environ.get("ECOM_TIMEZONE") or "America/Chicago")
+DASHBOARD_URL = "https://cashcow-ecommerce.onrender.com"
+TICK_SECONDS = 300
+
+# The Automation tab's switches. "free" ones work now; the others are upgrades for later.
+SWITCHES = [
+    {"key": "auto_route", "label": "Check for new orders every 5 minutes", "group": "free", "default": True,
+     "about": "New paid orders are matched to the nearest supplier warehouse and local hub, and land on your To-order list."},
+    {"key": "auto_processing", "label": "Mark new paid orders \"Processing\" in Ecwid", "group": "free", "default": True,
+     "about": "Customers see their order is being worked on. Needs the switch above."},
+    {"key": "daily_email", "label": "Daily summary email at 7 AM", "group": "free", "default": True,
+     "about": "New orders, what still needs ordering from suppliers, and anything stuck, sent to your admin email."},
+    {"key": "ask_actions", "label": "Ask Claude can set things up for you", "group": "free", "default": True,
+     "about": "Claude suggests warehouses, SKU rules, products from photos and order updates. Nothing changes until you tap Confirm."},
+    {"key": "cj_auto_order", "label": "Send CJ orders to CJ automatically", "group": "upgrade", "default": False, "coming": True,
+     "about": "Orders for CJ items are placed with CJdropshipping and paid from your CJ balance. Needs CJ_API_KEY."},
+    {"key": "cj_sync", "label": "Sync CJ tracking numbers and stock", "group": "upgrade", "default": False, "coming": True,
+     "about": "Tracking goes to Ecwid (which emails the customer) and stock levels stay current. Needs CJ_API_KEY."},
+    {"key": "ai_writer", "label": "AI writes listings for new products", "group": "upgrade", "default": False, "coming": True,
+     "about": "Products added without a description get one written by Claude. A few cents each."},
+    {"key": "hub_texts", "label": "Text each hub its delivery route", "group": "upgrade", "default": False, "coming": True,
+     "about": "Morning text with the route link to each hub's phone, through your Twilio number."},
+    {"key": "channels", "label": "Sell on Amazon and eBay", "group": "upgrade", "default": False, "coming": True, "external": True,
+     "about": "Turned on inside Ecwid (Sales channels). Available on Ecwid's higher plans."},
+]
+
+
+def switch_ready(key: str) -> str:
+    """Empty string when the switch can be used, otherwise what's missing."""
+    if key == "daily_email" and not (GMAIL and GMAIL_PASSWORD):
+        return "Needs LEAD_GMAIL_ADDRESS and LEAD_GMAIL_APP_PASSWORD in Render."
+    if key == "ask_actions" and not ANTHROPIC_API_KEY:
+        return "Needs ANTHROPIC_API_KEY in Render."
+    sw = next((x for x in SWITCHES if x["key"] == key), {})
+    if sw.get("coming"):
+        return "Coming in a later update."
+    return ""
 
 FULFILLMENT = ["AWAITING_PROCESSING", "PROCESSING", "SHIPPED", "OUT_FOR_DELIVERY", "DELIVERED",
                "READY_FOR_PICKUP", "WILL_NOT_DELIVER", "RETURNED"]
@@ -234,6 +283,11 @@ def route_order(o: dict, wh: list, rules: list, meta: dict) -> dict:
         "hub": ({"id": hub["id"], "name": hub["name"], "miles": hub_mi} if hub else None),
         "hub_manual": bool(m.get("hub_id")),
         "notes": m.get("notes") or "",
+        "ordered": m.get("ordered") or {},
+        "processed": bool(m.get("processed_at")),
+        "ship_to": "\n".join(x for x in [sp.get("name"), sp.get("companyName"), sp.get("street"),
+                                          " ".join(y for y in [f"{sp.get('city') or ''},", sp.get("stateOrProvinceCode"), sp.get("postalCode")] if y),
+                                          sp.get("countryName") or sp.get("countryCode"), sp.get("phone")] if x and x.strip(",")),
         "items": items,
         "open": (o.get("fulfillmentStatus") or "") not in DONE,
     }
@@ -262,6 +316,139 @@ def map_links(hub, stops):
         links.append(f"https://www.google.com/maps/dir/{path}")
         start = f"{chunk[-1]['lat']},{chunk[-1]['lng']}"
     return links
+
+
+# ---------- automation ----------
+async def all_routed(days: int = 90):
+    orders = await fetch_orders(days)
+    wh, rules, meta = await load_setup()
+    return [route_order(o, wh, rules, meta) for o in orders], wh
+
+
+async def load_settings() -> dict:
+    rows = await db("GET", "ecom_settings", params={"select": "*"}) or []
+    vals = {r["key"]: r.get("value") for r in rows}
+    out = {sw["key"]: bool(vals.get(sw["key"], sw["default"])) for sw in SWITCHES}
+    out["_last_run"] = vals.get("_last_run") or {}
+    out["_last_daily"] = vals.get("_last_daily") or ""
+    return out
+
+
+async def save_setting(key: str, value):
+    await db("POST", "ecom_settings", params={"on_conflict": "key"}, body={"key": key, "value": value},
+             prefer="resolution=merge-duplicates,return=minimal")
+
+
+async def save_meta(oid: str, fields: dict):
+    row = {"order_id": oid, "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), **fields}
+    await db("POST", "ecom_order_meta", params={"on_conflict": "order_id"}, body=row,
+             prefer="resolution=merge-duplicates,return=minimal")
+
+
+def needs_ordering(o: dict) -> list:
+    """Suppliers this open order still has to be placed with (by hand, until auto-ordering exists)."""
+    if not o["open"] or o["payment"] != "PAID":
+        return []
+    sups = []
+    for i in o["items"]:
+        sup = i["supplier"] or "Unknown supplier"
+        if sup not in sups and not o["ordered"].get(sup):
+            sups.append(sup)
+    return sups
+
+
+def send_email(to: list, subject: str, body: str) -> int:
+    to = [t for t in to if t]
+    if not to or not (GMAIL and GMAIL_PASSWORD):
+        return 0
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = formataddr(("CashCow eCommerce", GMAIL))
+    msg["To"] = ", ".join(to)
+    msg.set_content(body)
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=15) as smtp:
+        smtp.login(GMAIL, GMAIL_PASSWORD)
+        smtp.send_message(msg)
+    return len(to)
+
+
+def daily_text(orders: list, today: str) -> str:
+    yday = [o for o in orders if o["payment"] == "PAID" and (o["created"] or "")[:10] >= today]
+    open_o = [o for o in orders if o["open"]]
+    todo = [(o, needs_ordering(o)) for o in open_o]
+    todo = [(o, s) for o, s in todo if s]
+    lines = [f"CashCow eCommerce daily summary (new paid orders since {today}: {len(yday)})", ""]
+    lines.append(f"Open orders: {len(open_o)}")
+    lines.append(f"Still need ordering from suppliers: {len(todo)}")
+    if todo:
+        for o, sups in todo[:25]:
+            lines.append(f"  - #{o['number']} ({o['state']} {o['zip']}): {', '.join(sups)}")
+    stuck = [o for o in open_o if not o["hub"] or not o["zip_found"]]
+    if stuck:
+        lines.append(f"Need a look (no hub or bad ZIP): {len(stuck)}")
+        for o in stuck[:15]:
+            lines.append(f"  - #{o['number']} {o['zip'] or 'no ZIP'}")
+    unpaid = [o for o in open_o if o["payment"] != "PAID"]
+    if unpaid:
+        lines.append(f"Waiting on payment: {len(unpaid)}")
+    lines += ["", f"Open the dashboard: {DASHBOARD_URL}", "", "Turn this email off in the dashboard's Automation tab."]
+    return "\n".join(lines)
+
+
+_running = {"busy": False}
+
+
+async def tick(force: bool = False) -> dict:
+    """One automation pass: process new paid orders, then the daily email when it's due."""
+    if _running["busy"] or not ecwid_ready():
+        return {}
+    _running["busy"] = True
+    report = {"at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "processed": 0, "emailed": False, "error": ""}
+    try:
+        st = await load_settings()
+        if st["auto_route"] or force:
+            _cache.pop("orders90", None)
+            orders, _ = await all_routed()
+            for o in orders:
+                if o["processed"] or o["payment"] != "PAID" or o["status"] != "AWAITING_PROCESSING":
+                    continue
+                if st["auto_processing"]:
+                    await ecwid("PUT", f"/orders/{o['id']}", body={"fulfillmentStatus": "PROCESSING"})
+                await save_meta(o["id"], {"processed_at": report["at"]})
+                report["processed"] += 1
+            if report["processed"]:
+                _cache.pop("orders90", None)
+        now = datetime.now(TZ)
+        today = now.strftime("%Y-%m-%d")
+        if st["daily_email"] and not switch_ready("daily_email") and now.hour >= 7 and st["_last_daily"] != today:
+            orders, _ = await all_routed()
+            sent = await asyncio.to_thread(send_email, sorted(ECOM_ADMIN_EMAILS), f"CashCow eCommerce: {today} summary",
+                                           daily_text(orders, (now - timedelta(days=1)).strftime("%Y-%m-%d")))
+            if sent:
+                await save_setting("_last_daily", today)
+                report["emailed"] = True
+    except HTTPException as e:
+        report["error"] = str(e.detail)
+    except Exception as e:  # keep the loop alive
+        report["error"] = type(e).__name__
+        _ctx["logger"].error("ecom tick failed: %s", e)
+    finally:
+        _running["busy"] = False
+    try:
+        await save_setting("_last_run", report)
+    except HTTPException:
+        pass
+    return report
+
+
+async def tick_loop():
+    await asyncio.sleep(30)
+    while True:
+        try:
+            await tick()
+        except Exception as e:
+            _ctx["logger"].error("ecom loop: %s", e)
+        await asyncio.sleep(TICK_SECONDS)
 
 
 # ---------- request models ----------
@@ -305,16 +492,83 @@ on crov.com.
 
 Answer the owner's question using the store data below. Be short and practical: plain sentences or a few bullets, no
 tables, no markdown headings. Quote order numbers, states and dollar amounts exactly as given. If the data doesn't answer
-the question, say what's missing. When a photo is attached (a product, label, packing slip, invoice or screenshot), read it
+the question, say what's missing. When the owner asks you to set something up or change something, use the matching tool to propose it (you may propose
+several); they see each one with a Confirm button, and nothing changes until they tap it. In your text, say briefly what you
+proposed. Only propose what they asked for or clearly need. When a photo is attached (a product, label, packing slip, invoice or screenshot), read it
 carefully and use what you see: for a product, suggest a store title, a short description, a likely category and a sensible
 SKU start for its supplier. You can't change anything yourself: when an action is needed, say which dashboard tab
 does it (Orders, Routes, Warehouses, Products, ZIP check) or that it's done in Ecwid. Don't invent numbers."""
+
+
+ASK_TOOLS = [
+    {"name": "add_warehouse", "description": "Propose adding a warehouse: a supplier warehouse (where products ship from) or a local logistics hub (delivers in its area). Needs a real 5-digit US ZIP.",
+     "input_schema": {"type": "object", "properties": {
+         "name": {"type": "string"}, "kind": {"type": "string", "enum": ["supplier", "logistics"]},
+         "supplier": {"type": "string", "description": "Supplier name for supplier warehouses, e.g. CJ or CROV"},
+         "zip": {"type": "string"}, "categories": {"type": "string"}}, "required": ["name", "kind", "zip"]}},
+    {"name": "add_sku_rule", "description": "Propose a SKU rule: products whose SKU starts with `match` come from `supplier`.",
+     "input_schema": {"type": "object", "properties": {"match": {"type": "string"}, "supplier": {"type": "string"}}, "required": ["match", "supplier"]}},
+    {"name": "create_product", "description": "Propose creating a product in the Ecwid store, e.g. from a photo. Use a SKU that starts with the supplier's letters (like CJ- or CROV-). Price in US dollars.",
+     "input_schema": {"type": "object", "properties": {
+         "name": {"type": "string"}, "sku": {"type": "string"}, "price": {"type": "number"},
+         "description": {"type": "string", "description": "2-4 short sentences, plain text"},
+         "quantity": {"type": "integer", "description": "Stock count; leave out for unlimited (dropship)"},
+         "use_photo": {"type": "boolean", "description": "true to use the photo the owner attached as the product image"}},
+         "required": ["name", "sku", "price", "description"]}},
+    {"name": "update_order", "description": "Propose changing an order's status and/or tracking number in Ecwid.",
+     "input_schema": {"type": "object", "properties": {
+         "order_number": {"type": "integer"},
+         "status": {"type": "string", "enum": ["AWAITING_PROCESSING", "PROCESSING", "SHIPPED", "OUT_FOR_DELIVERY", "DELIVERED", "READY_FOR_PICKUP", "WILL_NOT_DELIVER", "RETURNED"]},
+         "tracking": {"type": "string"}}, "required": ["order_number"]}},
+    {"name": "mark_supplier_ordered", "description": "Propose marking that an order was placed with a supplier (after the owner says they ordered it).",
+     "input_schema": {"type": "object", "properties": {"order_number": {"type": "integer"}, "supplier": {"type": "string"}, "ref": {"type": "string"}},
+                      "required": ["order_number", "supplier"]}},
+]
+
+
+def action_summary(t: str, i: dict) -> str:
+    if t == "add_warehouse":
+        kind = "local hub" if i.get("kind") == "logistics" else f"supplier warehouse ({i.get('supplier') or '?'})"
+        return f"Add {kind} \"{i.get('name')}\" at ZIP {i.get('zip')}"
+    if t == "add_sku_rule":
+        return f"Add SKU rule: {str(i.get('match', '')).upper()} → {i.get('supplier')}"
+    if t == "create_product":
+        q = "unlimited stock" if i.get("quantity") is None else f"stock {i.get('quantity')}"
+        return f"Create product \"{i.get('name')}\" · SKU {i.get('sku')} · ${i.get('price')} · {q}" + (" · with your photo" if i.get("use_photo") else "")
+    if t == "update_order":
+        bits = [b for b in [i.get("status") and f"status {i['status'].replace('_', ' ').lower()}", i.get("tracking") and f"tracking {i['tracking']}"] if b]
+        return f"Update order #{i.get('order_number')}: " + (", ".join(bits) or "no change")
+    if t == "mark_supplier_ordered":
+        return f"Mark order #{i.get('order_number')} as ordered from {i.get('supplier')}" + (f" (ref {i['ref']})" if i.get("ref") else "")
+    return t
+
+
+class SwitchIn(BaseModel):
+    key: str
+    on: bool
+
+
+class OrderedIn(BaseModel):
+    supplier: str
+    ref: str = ""
+    undo: bool = False
+
+
+class ActionIn(BaseModel):
+    type: str
+    input: dict = {}
+    image: str = ""
+    image_type: str = ""
 
 
 class ProductUpdate(BaseModel):
     price: Optional[float] = None
     quantity: Optional[int] = None
     enabled: Optional[bool] = None
+
+
+def _html_escape(t: str) -> str:
+    return t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 def clean(s, n):
@@ -334,9 +588,13 @@ def register(app, *, account_user, auth_headers, supabase_url, logger):
         return user
 
     async def routed(days=90):
-        orders = await fetch_orders(days)
-        wh, rules, meta = await load_setup()
-        return [route_order(o, wh, rules, meta) for o in orders], wh
+        return await all_routed(days)
+
+    on_event = getattr(app, "on_event", None)
+    if on_event:
+        @on_event("startup")
+        async def _start_ecom_loop():
+            asyncio.create_task(tick_loop())
 
     @app.get("/api/ecom/overview")
     async def ecom_overview(request: Request):
@@ -596,12 +854,14 @@ def register(app, *, account_user, auth_headers, supabase_url, logger):
         if messages and messages[-1]["role"] == "user":
             messages.pop()
         snapshot = await store_snapshot()
+        use_tools = (await load_settings())["ask_actions"]
         text = {"type": "text", "text": f"<store_data>\n{snapshot}\n</store_data>\n\nQuestion: {q}"}
         messages.append({"role": "user", "content": [img, text] if img else [text]})
         try:
             async with httpx.AsyncClient(timeout=60) as client:
                 r = await client.post("https://api.anthropic.com/v1/messages", json={
-                    "model": ECOM_CLAUDE_MODEL, "max_tokens": 1200, "system": ASK_SYSTEM, "messages": messages,
+                    "model": ECOM_CLAUDE_MODEL, "max_tokens": 1500, "system": ASK_SYSTEM, "messages": messages,
+                    **({"tools": ASK_TOOLS} if use_tools else {}),
                 }, headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"})
         except httpx.HTTPError:
             raise HTTPException(status_code=502, detail="Couldn't reach Claude. Try again in a minute.")
@@ -614,4 +874,120 @@ def register(app, *, account_user, auth_headers, supabase_url, logger):
             raise HTTPException(status_code=502, detail="Claude couldn't answer right now. Try again in a minute.")
         data = r.json()
         answer = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text").strip()
-        return {"answer": answer or "No answer came back. Try asking another way."}
+        actions = [{"type": b["name"], "input": b.get("input") or {}, "summary": action_summary(b["name"], b.get("input") or {})}
+                   for b in data.get("content", []) if b.get("type") == "tool_use" and b.get("name") in {t["name"] for t in ASK_TOOLS}]
+        if not answer and actions:
+            answer = "Here's what I can set up. Tap Confirm on each one you want."
+        return {"answer": answer or "No answer came back. Try asking another way.", "actions": actions[:8]}
+
+    async def ecwid_image(pid: int, b64: str, ctype: str) -> bool:
+        import base64 as _b
+        try:
+            raw = _b.b64decode(b64, validate=True)
+            async with httpx.AsyncClient(timeout=30) as client:
+                r = await client.post(f"https://app.ecwid.com/api/v3/{ECWID_STORE_ID}/products/{pid}/image", content=raw,
+                                      headers={"Authorization": f"Bearer {ECWID_SECRET_TOKEN}", "Content-Type": ctype})
+            return r.status_code < 300
+        except (httpx.HTTPError, ValueError):
+            return False
+
+    @app.post("/api/ecom/action")
+    async def ecom_action(payload: ActionIn, request: Request):
+        await admin(request)
+        if not (await load_settings())["ask_actions"]:
+            raise HTTPException(status_code=403, detail="Turn on \"Ask Claude can set things up\" in the Automation tab first.")
+        t, i = payload.type, payload.input or {}
+        if t == "add_warehouse":
+            return await ecom_save_warehouse(WarehouseIn(name=str(i.get("name", "")), kind=str(i.get("kind", "logistics")),
+                                                         supplier=str(i.get("supplier", "")), zip=str(i.get("zip", "")),
+                                                         categories=str(i.get("categories", ""))), request) | {"message": "Warehouse added."}
+        if t == "add_sku_rule":
+            await ecom_save_rule(RuleIn(match=str(i.get("match", "")), supplier=str(i.get("supplier", ""))), request)
+            return {"ok": True, "message": "SKU rule added."}
+        if t == "create_product":
+            try:
+                price = round(float(i.get("price")), 2)
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail="The price is missing.")
+            name, sku = clean(i.get("name"), 200), clean(i.get("sku"), 60).upper()
+            if not name or not sku or not 0 <= price <= 100000:
+                raise HTTPException(status_code=400, detail="The product needs a name, SKU and price.")
+            body = {"name": name, "sku": sku, "price": price, "enabled": True,
+                    "description": "".join(f"<p>{_html_escape(x)}</p>" for x in clean(i.get("description"), 3000).split("\n") if x.strip())}
+            if isinstance(i.get("quantity"), int):
+                body.update(quantity=max(0, i["quantity"]), unlimited=False)
+            else:
+                body["unlimited"] = True
+            made = await ecwid("POST", "/products", body=body)
+            pid = made.get("id")
+            pic = ""
+            if pid and i.get("use_photo") and payload.image and payload.image_type in ("image/jpeg", "image/png", "image/webp"):
+                pic = " with your photo" if await ecwid_image(pid, payload.image, payload.image_type) else " (the photo didn't upload; add it in Ecwid)"
+            return {"ok": True, "message": f"Product created in Ecwid{pic}.", "id": pid}
+        if t == "update_order":
+            num = str(i.get("order_number", ""))
+            await ecom_update_order(num, OrderUpdate(status=str(i.get("status") or ""),
+                                                     tracking=(str(i["tracking"]) if i.get("tracking") else None)), request)
+            return {"ok": True, "message": f"Order #{num} updated."}
+        if t == "mark_supplier_ordered":
+            num = str(i.get("order_number", ""))
+            orders, _ = await routed()
+            o = next((x for x in orders if str(x["number"]) == num), None)
+            if not o:
+                raise HTTPException(status_code=404, detail=f"Order #{num} wasn't found.")
+            return await ecom_mark_ordered(o["id"], OrderedIn(supplier=str(i.get("supplier", "")), ref=str(i.get("ref", ""))), request)
+        raise HTTPException(status_code=400, detail="Unknown action.")
+
+    # ----- Automation tab -----
+    @app.get("/api/ecom/automation")
+    async def ecom_automation(request: Request):
+        await admin(request)
+        st = await load_settings()
+        return {"switches": [{**sw, "on": st[sw["key"]], "blocked": switch_ready(sw["key"])} for sw in SWITCHES],
+                "last_run": st["_last_run"], "last_daily": st["_last_daily"], "every_minutes": TICK_SECONDS // 60}
+
+    @app.post("/api/ecom/automation")
+    async def ecom_set_switch(payload: SwitchIn, request: Request):
+        await admin(request)
+        if payload.key not in {sw["key"] for sw in SWITCHES}:
+            raise HTTPException(status_code=400, detail="Unknown switch.")
+        if payload.on and switch_ready(payload.key):
+            raise HTTPException(status_code=400, detail=switch_ready(payload.key))
+        await save_setting(payload.key, payload.on)
+        return {"ok": True}
+
+    @app.post("/api/ecom/automation/run")
+    async def ecom_run_now(request: Request):
+        await admin(request)
+        rep = await tick(force=True)
+        if not rep:
+            raise HTTPException(status_code=409, detail="A check is already running. Try again in a moment.")
+        return rep
+
+    # ----- To-order list -----
+    @app.get("/api/ecom/to-order")
+    async def ecom_to_order(request: Request):
+        await admin(request)
+        orders, _ = await routed()
+        groups: dict = {}
+        for o in sorted(orders, key=lambda x: x["created"] or ""):
+            for sup in needs_ordering(o):
+                groups.setdefault(sup, []).append({**o, "items": [i for i in o["items"] if (i["supplier"] or "Unknown supplier") == sup]})
+        return {"groups": [{"supplier": k, "orders": v} for k, v in sorted(groups.items(), key=lambda kv: -len(kv[1]))]}
+
+    @app.post("/api/ecom/orders/{oid}/ordered")
+    async def ecom_mark_ordered(oid: str, payload: OrderedIn, request: Request):
+        await admin(request)
+        if not re.fullmatch(r"[A-Za-z0-9-]{1,40}", oid):
+            raise HTTPException(status_code=404, detail="Not found.")
+        sup = clean(payload.supplier, 60)
+        if not sup:
+            raise HTTPException(status_code=400, detail="Which supplier?")
+        rows = await db("GET", "ecom_order_meta", params={"order_id": f"eq.{oid}", "select": "ordered"}) or []
+        ordered = dict((rows[0].get("ordered") if rows else None) or {})
+        if payload.undo:
+            ordered.pop(sup, None)
+        else:
+            ordered[sup] = {"at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "ref": clean(payload.ref, 80)}
+        await save_meta(oid, {"ordered": ordered})
+        return {"ok": True, "message": f"Marked as ordered from {sup}." if not payload.undo else "Undone."}
