@@ -634,9 +634,78 @@ tables, no markdown headings. Quote order numbers, states and dollar amounts exa
 the question, say what's missing. When the owner asks you to set something up or change something, use the matching tool to propose it (you may propose
 several); they see each one with a Confirm button, and nothing changes until they tap it. In your text, say briefly what you
 proposed. Only propose what they asked for or clearly need. When a photo is attached (a product, label, packing slip, invoice or screenshot), read it
-carefully and use what you see: for a product, suggest a store title, a short description, a likely category and a sensible
-SKU start for its supplier. You can't change anything yourself: when an action is needed, say which dashboard tab
+carefully and use what you see: for a product, suggest a store title, a short description, a sensible SKU start for its supplier, and a store section
+and shelf (sections: Everyday Essentials, The Candy Lady, Candles, or another fitting one). You can't change anything yourself: when an action is needed, say which dashboard tab
 does it (Orders, Routes, Warehouses, Products, ZIP check) or that it's done in Ecwid. Don't invent numbers."""
+
+
+# One-tap store sections: a main category with its shelves, created in Ecwid.
+SECTIONS = {
+    "essentials": {"name": "Everyday Essentials", "icon": "🧼",
+                   "about": "Everything for the home and personal care in one place, so customers stock up in one trip.",
+                   "shelves": ["Oral Care", "Bath & Body", "Hair Care", "Paper Goods", "Bathroom Cleaning",
+                               "Kitchen & Dish", "Laundry", "First Aid & Personal Care"]},
+    "candy": {"name": "The Candy Lady", "icon": "🍬",
+              "about": "Candy, snacks, drinks and party treats, shipped to your door.",
+              "shelves": ["Candy", "Nostalgia Candy", "Snacks", "Drinks & Treats", "Freeze-Dried Treats", "Party & Dollar Items"]},
+    "candles": {"name": "Candles", "icon": "🕯️",
+                "about": "Hand-poured and custom-label scented candles.",
+                "shelves": ["Scented Candles", "Gift Sets", "Wax Melts"]},
+}
+
+
+async def ecwid_categories() -> list:
+    out, offset = [], 0
+    while offset < 2000:
+        page = await ecwid("GET", "/categories", params={"limit": 100, "offset": offset})
+        items = page.get("items") or []
+        out.extend(items)
+        if len(items) < 100:
+            break
+        offset += 100
+    return out
+
+
+async def ensure_category(name: str, parent_id: int = 0, description: str = "", cats: Optional[list] = None) -> dict:
+    """Find a category by name under its parent, or create it. Returns {id, name, url, created}."""
+    cats = cats if cats is not None else await ecwid_categories()
+    for c in cats:
+        if (c.get("name") or "").strip().lower() == name.strip().lower() and int(c.get("parentId") or 0) == int(parent_id or 0):
+            return {"id": c["id"], "name": c["name"], "url": c.get("url") or "", "created": False}
+    body = {"name": name, "enabled": True}
+    if parent_id:
+        body["parentId"] = parent_id
+    if description:
+        body["description"] = f"<p>{_html_escape(description)}</p>"
+    made = await ecwid("POST", "/categories", body=body)
+    cats.append({"id": made.get("id"), "name": name, "parentId": parent_id})
+    return {"id": made.get("id"), "name": name, "url": "", "created": True}
+
+
+async def build_section(key: str) -> dict:
+    t = SECTIONS[key]
+    cats = await ecwid_categories()
+    top = await ensure_category(t["name"], 0, t["about"], cats)
+    made = [s for s in [await ensure_category(sh, top["id"], "", cats) for sh in t["shelves"]] if s["created"]]
+    if not top["url"]:
+        try:
+            top["url"] = (await ecwid("GET", f"/categories/{top['id']}")).get("url") or ""
+        except HTTPException:
+            pass
+    return {"section": t["name"], "id": top["id"], "url": top["url"], "new_shelves": len(made) + (1 if top["created"] else 0)}
+
+
+async def category_id_for(path: str) -> Optional[int]:
+    """'Everyday Essentials > Oral Care' or 'Oral Care' -> category id (created if missing)."""
+    parts = [p.strip() for p in re.split(r">|/", path or "") if p.strip()][:2]
+    if not parts:
+        return None
+    cats = await ecwid_categories()
+    if len(parts) == 2:
+        top = await ensure_category(parts[0], 0, "", cats)
+        return (await ensure_category(parts[1], top["id"], "", cats))["id"]
+    hit = next((c for c in cats if (c.get("name") or "").lower() == parts[0].lower()), None)
+    return hit["id"] if hit else (await ensure_category(parts[0], 0, "", cats))["id"]
 
 
 ASK_TOOLS = [
@@ -652,7 +721,8 @@ ASK_TOOLS = [
          "name": {"type": "string"}, "sku": {"type": "string"}, "price": {"type": "number"},
          "description": {"type": "string", "description": "2-4 short sentences, plain text"},
          "quantity": {"type": "integer", "description": "Stock count; leave out for unlimited (dropship)"},
-         "use_photo": {"type": "boolean", "description": "true to use the photo the owner attached as the product image"}},
+         "use_photo": {"type": "boolean", "description": "true to use the photo the owner attached as the product image"},
+         "category": {"type": "string", "description": "Store section and shelf, e.g. 'Everyday Essentials > Oral Care' or 'The Candy Lady > Snacks'"}},
          "required": ["name", "sku", "price", "description"]}},
     {"name": "update_order", "description": "Propose changing an order's status and/or tracking number in Ecwid.",
      "input_schema": {"type": "object", "properties": {
@@ -673,7 +743,8 @@ def action_summary(t: str, i: dict) -> str:
         return f"Add SKU rule: {str(i.get('match', '')).upper()} → {i.get('supplier')}"
     if t == "create_product":
         q = "unlimited stock" if i.get("quantity") is None else f"stock {i.get('quantity')}"
-        return f"Create product \"{i.get('name')}\" · SKU {i.get('sku')} · ${i.get('price')} · {q}" + (" · with your photo" if i.get("use_photo") else "")
+        return (f"Create product \"{i.get('name')}\" · SKU {i.get('sku')} · ${i.get('price')} · {q}" + (" · with your photo" if i.get("use_photo") else "")
+                + (f" · in {i['category']}" if i.get("category") else ""))
     if t == "update_order":
         bits = [b for b in [i.get("status") and f"status {i['status'].replace('_', ' ').lower()}", i.get("tracking") and f"tracking {i['tracking']}"] if b]
         return f"Update order #{i.get('order_number')}: " + (", ".join(bits) or "no change")
@@ -908,6 +979,30 @@ def register(app, *, account_user, auth_headers, supabase_url, logger):
                 + (f", {r['no_warehouse']} with no supplier warehouse yet" if r["no_warehouse"] else "")
                 + (f", {r['yours']} with your own ribbon left alone" if r["yours"] else "") + "."}
 
+    @app.get("/api/ecom/sections")
+    async def ecom_sections(request: Request):
+        await admin(request)
+        return {"sections": [{"key": k, "name": t["name"], "icon": t["icon"], "about": t["about"], "shelves": t["shelves"]}
+                             for k, t in SECTIONS.items()]}
+
+    @app.post("/api/ecom/sections/{key}")
+    async def ecom_build_section(key: str, request: Request):
+        await admin(request)
+        if key not in SECTIONS:
+            raise HTTPException(status_code=404, detail="Unknown section.")
+        r = await build_section(key)
+        if key == "candy" and r["url"]:
+            try:
+                import candy
+                if not (await candy.candy_settings())["candy_url"]:
+                    await save_setting("candy_url", r["url"])
+                    r["candy_link_set"] = True
+            except HTTPException:
+                pass
+        r["message"] = (f"{r['section']} is ready in your store" + (f" ({r['new_shelves']} new shelves)" if r["new_shelves"] else " (it was already there)")
+                        + (". It's now the link every Candy Lady shares." if r.get("candy_link_set") else "."))
+        return r
+
     @app.get("/api/ecom/products")
     async def ecom_products(request: Request, q: str = "", offset: int = 0):
         await admin(request)
@@ -1080,6 +1175,10 @@ def register(app, *, account_user, auth_headers, supabase_url, logger):
             rib = ribbon_for(sku, wh_, rules_)
             if rib:
                 body["ribbon"] = {"text": rib, "color": RIBBON_COLOR}
+            if i.get("category"):
+                cid = await category_id_for(str(i["category"]))
+                if cid:
+                    body["categoryIds"] = [cid]
             made = await ecwid("POST", "/products", body=body)
             pid = made.get("id")
             pic = ""
