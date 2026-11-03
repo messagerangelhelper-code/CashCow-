@@ -36,6 +36,7 @@ ALLOWED_ORIGINS = [
     "https://my-shopping-helper.onrender.com",          # My Shopping Helper app (Premium checkout)
     "https://cashcow-mail.onrender.com",                # CashCow Mail dashboard (admins only)
     "https://scamshield-email-guard.onrender.com",      # ScamShield Email Guard (part of ScamShield Premium)
+    "https://cashcow-ecommerce.onrender.com",           # CashCow eCommerce control dashboard (admins only)
 ]
 
 app.add_middleware(
@@ -1918,6 +1919,13 @@ cashcow_mail.register(
     public_api=PUBLIC_API_URL,
     user_premium=lambda uid: _user_premium(uid, "scamshield"),
 )
+
+
+# --- CashCow eCommerce: control dashboard for the Ecwid store (ecom.py, ecom.sql, ecom_zips.json) ---
+import ecom as cashcow_ecom
+
+cashcow_ecom.register(app, account_user=lambda auth: account_user(auth), auth_headers=_auth_headers,
+                      supabase_url=AUTH_SUPABASE_URL, logger=logger)
 
 
 # --- ScamShield "My Data Exposure": has this email shown up in a data breach? ---
