@@ -357,19 +357,50 @@ def needs_ordering(o: dict) -> list:
     return sups
 
 
-def send_email(to: list, subject: str, body: str) -> int:
+def _gmail_send(msg) -> None:
+    """Gmail over SSL (465); if that connection is closed, try STARTTLS (587)."""
+    try:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=20) as smtp:
+            smtp.login(GMAIL, GMAIL_PASSWORD)
+            smtp.send_message(msg)
+            return
+    except (smtplib.SMTPServerDisconnected, OSError):
+        pass
+    with smtplib.SMTP("smtp.gmail.com", 587, timeout=20) as smtp:
+        smtp.starttls()
+        smtp.login(GMAIL, GMAIL_PASSWORD)
+        smtp.send_message(msg)
+
+
+async def send_email(to: list, subject: str, body: str) -> int:
+    """Gmail first; if Gmail can't be reached, Amazon SES (CashCow Mail's sender)."""
     to = [t for t in to if t]
-    if not to or not (GMAIL and GMAIL_PASSWORD):
+    if not to:
         return 0
     msg = EmailMessage()
     msg["Subject"] = subject
-    msg["From"] = formataddr(("CashCow eCommerce", GMAIL))
     msg["To"] = ", ".join(to)
     msg.set_content(body)
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=15) as smtp:
-        smtp.login(GMAIL, GMAIL_PASSWORD)
-        smtp.send_message(msg)
-    return len(to)
+    problems = []
+    if GMAIL and GMAIL_PASSWORD:
+        msg["From"] = formataddr(("CashCow eCommerce", GMAIL))
+        try:
+            await asyncio.to_thread(_gmail_send, msg)
+            return len(to)
+        except Exception as e:
+            problems.append(f"Gmail: {type(e).__name__}")
+    try:
+        import mail as _mail
+        if _mail.ses_ready():
+            del msg["From"]
+            msg["From"] = os.environ.get("MAIL_FROM") or "CashCow <news@cashcowai.online>"
+            for t in to:
+                await _mail.ses_send_raw(msg.as_bytes(), t)
+            return len(to)
+    except Exception as e:
+        problems.append(f"SES: {type(e).__name__}")
+    _ctx["logger"].error("Daily email not sent: %s", "; ".join(problems) or "no sender set up")
+    return 0
 
 
 def daily_text(orders: list, today: str) -> str:
@@ -420,13 +451,17 @@ async def tick(force: bool = False) -> dict:
                 _cache.pop("orders90", None)
         now = datetime.now(TZ)
         today = now.strftime("%Y-%m-%d")
-        if st["daily_email"] and not switch_ready("daily_email") and now.hour >= 7 and st["_last_daily"] != today:
+        if (st["daily_email"] and not switch_ready("daily_email") and now.hour >= 7 and st["_last_daily"] != today
+                and time.time() - _running.get("mail_try", 0) > 3600):     # if sending fails, retry hourly, not every 5 minutes
+            _running["mail_try"] = time.time()
             orders, _ = await all_routed()
-            sent = await asyncio.to_thread(send_email, sorted(ECOM_ADMIN_EMAILS), f"CashCow eCommerce: {today} summary",
-                                           daily_text(orders, (now - timedelta(days=1)).strftime("%Y-%m-%d")))
+            sent = await send_email(sorted(ECOM_ADMIN_EMAILS), f"CashCow eCommerce: {today} summary",
+                                    daily_text(orders, (now - timedelta(days=1)).strftime("%Y-%m-%d")))
             if sent:
                 await save_setting("_last_daily", today)
                 report["emailed"] = True
+            else:
+                report["error"] = "The daily email couldn't be sent. Will try again in an hour."
     except HTTPException as e:
         report["error"] = str(e.detail)
     except Exception as e:  # keep the loop alive
