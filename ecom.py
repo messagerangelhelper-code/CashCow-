@@ -100,6 +100,8 @@ SWITCHES = [
      "about": "Each product gets a label like \"📍 Ships from Cranbury, NJ 08512\" from its supplier's warehouse, so nearby customers see it arrives fast. Checked every hour; ribbons you typed yourself in Ecwid are never changed."},
     {"key": "ask_actions", "label": "Ask Claude can set things up for you", "group": "free", "default": True,
      "about": "Claude suggests warehouses, SKU rules, products from photos and order updates. Nothing changes until you tap Confirm."},
+    {"key": "mkt_weekly", "label": "Weekly marketing report every Monday", "group": "free", "default": True,
+     "about": "For each app: visits, where visitors came from, what they searched for on your sites, and the words people type into DuckDuckGo and Bing around your keywords. See the Marketing tab."},
     {"key": "cj_auto_order", "label": "Send CJ orders to CJ automatically", "group": "upgrade", "default": False, "coming": True,
      "about": "Orders for CJ items are placed with CJdropshipping and paid from your CJ balance. Needs CJ_API_KEY."},
     {"key": "cj_sync", "label": "Sync CJ tracking numbers and stock", "group": "upgrade", "default": False, "coming": True,
@@ -110,6 +112,8 @@ SWITCHES = [
      "about": "Morning text with the route link to each hub's phone, through your Twilio number."},
     {"key": "brevo_sync", "label": "Add customers to your Brevo email list", "group": "upgrade", "default": False, "coming": True,
      "about": "Customers who agree to emails at checkout, and new Candy Lady sellers, are added to your CashCow list in Brevo, ready for your next campaign. Free plan: 300 emails a day."},
+    {"key": "mkt_ads", "label": "Add ad-platform keywords to the marketing report", "group": "upgrade", "default": False, "coming": True,
+     "about": "Monthly searches and cost per click for each app's keywords, from your Microsoft (Bing) or Meta ad account. Needs an ad account connected; nothing is ever spent."},
     {"key": "channels", "label": "Sell everywhere through Ecwid's sales channels", "group": "channels", "default": True, "external": True,
      "about": "Facebook, Instagram, Google Shopping, TikTok, Amazon, eBay, Walmart, Pinterest and more. Turn each one on in Ecwid → Sales channels. Every channel's orders come into this dashboard automatically, labeled by channel."},
 ]
@@ -595,6 +599,12 @@ async def tick(force: bool = False) -> dict:
         if st["auto_ribbons"] and time.time() - _running.get("ribbons", 0) > 3600:
             _running["ribbons"] = time.time()
             report["ribbons"] = (await apply_ribbons())["updated"]
+        try:                      # weekly marketing report (marketing.py, marketing.sql)
+            import marketing
+            if await marketing.weekly_if_due(st):
+                report["marketing"] = "building"
+        except HTTPException:
+            pass                  # marketing.sql not run yet
         now = datetime.now(TZ)
         today = now.strftime("%Y-%m-%d")
         if (st["daily_email"] and not switch_ready("daily_email") and now.hour >= 7 and st["_last_daily"] != today
@@ -854,6 +864,9 @@ def register(app, *, account_user, auth_headers, supabase_url, logger):
 
     import cj                     # fill shelves from CJdropshipping (cj.py)
     cj.register(app, admin=admin, logger=logger)
+
+    import marketing              # weekly keyword report per app (marketing.py, marketing.sql)
+    marketing.register(app, admin=admin, logger=logger)
 
     @app.get("/api/ecom/overview")
     async def ecom_overview(request: Request):
